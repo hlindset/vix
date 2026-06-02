@@ -9,6 +9,7 @@
 #include "g_object/g_param_spec.h"
 #include "g_object/g_type.h"
 #include "pipe.h"
+#include "spool.h"
 #include "vips_boxed.h"
 #include "vips_foreign.h"
 #include "vips_image.h"
@@ -60,6 +61,9 @@ static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM load_info) {
     return 1;
 
   if (nif_pipe_init(env))
+    return 1;
+
+  if (nif_source_spool_init(env))
     return 1;
 
   return 0;
@@ -172,6 +176,11 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_write", 2, nif_write, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_read", 2, nif_read, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_source_new", 0, nif_source_new, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_target_new", 0, nif_target_new, ERL_NIF_DIRTY_JOB_CPU_BOUND}};
+    {"nif_target_new", 0, nif_target_new, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+
+    /* VipsSourceCustom spool */
+    {"nif_source_spool_new", 1, nif_source_spool_new, 0},
+    {"nif_source_spool_finalize", 1, nif_source_spool_finalize, 0},
+    {"nif_source_spool_abort", 1, nif_source_spool_abort, 0}};
 
 ERL_NIF_INIT(Elixir.Vix.Nif, nif_funcs, &on_load, NULL, NULL, NULL)

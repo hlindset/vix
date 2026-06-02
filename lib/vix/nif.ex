@@ -276,6 +276,15 @@ defmodule Vix.Nif do
   def nif_target_new,
     do: :erlang.nif_error(:nif_library_not_loaded)
 
+  def nif_source_spool_new(_content_length),
+    do: :erlang.nif_error(:nif_library_not_loaded)
+
+  def nif_source_spool_finalize(_spool),
+    do: :erlang.nif_error(:nif_library_not_loaded)
+
+  def nif_source_spool_abort(_spool),
+    do: :erlang.nif_error(:nif_library_not_loaded)
+
   @spec load_config :: map
   defp load_config do
     %{nif_logger_level: nif_logger_level()}
