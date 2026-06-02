@@ -575,5 +575,27 @@ defmodule Vix.Vips.ImageTest do
       assert {:error, :invalid_timeout} =
                Image.new_from_enum([<<>>], seekable: true, content_length: 1, timeout: 0)
     end
+
+    for name <- ["sample.heic", "sample.avif"] do
+      @tag :heif
+      @tag timeout: 10_000
+      test "decodes #{name} fed incrementally (seekable)" do
+        path = img_path(unquote(name))
+        # Clear opt-in failure if VIX_TEST_HEIF is set but the format isn't actually supported.
+        case Vix.Vips.Foreign.find_load(path) do
+          {:ok, _} -> :ok
+          _ -> flunk("VIX_TEST_HEIF set but libvips cannot load #{unquote(name)}")
+        end
+
+        {:ok, ref} = Image.new_from_file(path)
+        {enum, len} = chunked(path)
+
+        assert {:ok, img} =
+                 Image.new_from_enum(enum, seekable: true, content_length: len)
+
+        assert {Image.width(img), Image.height(img)} ==
+                 {Image.width(ref), Image.height(ref)}
+      end
+    end
   end
 end
