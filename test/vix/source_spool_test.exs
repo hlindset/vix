@@ -131,4 +131,46 @@ defmodule Vix.SourceSpoolTest do
     assert_receive {:decode_result, {:error, _}}, 5_000
     _ = decoder
   end
+
+  describe "start_feeder/2" do
+    test "feeds an enum and decodes" do
+      bytes = File.read!(img_path("puppies.jpg"))
+      chunks = for <<c::binary-size(8192) <- bytes>>, do: c
+      tail = binary_part(bytes, length(chunks) * 8192, byte_size(bytes) - length(chunks) * 8192)
+      enum = chunks ++ [tail]
+
+      {:ok, spool, _writer} =
+        SourceSpool.start_feeder(enum, content_length: byte_size(bytes))
+
+      {:ok, source} = SourceSpool.source(spool)
+      {:ok, img} = decode_source(source)
+      assert Image.width(img) > 0
+    end
+
+    @tag timeout: 10_000
+    test "finalizes at exactly content_length without pulling an extra (blocking) item" do
+      bytes = File.read!(img_path("puppies.jpg"))
+      # An enum that yields the whole body, then BLOCKS forever if pulled again.
+      enum = Stream.resource(
+        fn -> :first end,
+        fn
+          :first -> {[bytes], :done}
+          :done -> Process.sleep(:infinity)  # must never be reached
+        end,
+        fn _ -> :ok end
+      )
+
+      {:ok, spool, _writer} =
+        SourceSpool.start_feeder(enum, content_length: byte_size(bytes))
+
+      {:ok, source} = SourceSpool.source(spool)
+      assert {:ok, _img} = decode_source(source)
+    end
+
+    test "content_length: 0 finalizes without touching the enum" do
+      enum = Stream.map([:boom], fn _ -> raise "must not be pulled" end)
+      assert {:ok, _spool, _writer} =
+               SourceSpool.start_feeder(enum, content_length: 0)
+    end
+  end
 end

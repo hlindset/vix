@@ -48,6 +48,80 @@ defmodule Vix.SourceSpool do
     end
   end
 
+  @spec start_feeder(Enumerable.t(), keyword) :: {:ok, t, pid} | {:error, term}
+  def start_feeder(enum, opts) do
+    case Keyword.fetch(opts, :content_length) do
+      :error -> {:error, :content_length_required}   # don't raise; match the rest of the API
+      {:ok, len} -> do_start_feeder(enum, opts, len)
+    end
+  end
+
+  defp do_start_feeder(enum, opts, len) do
+    parent = self()
+
+    {writer, mon} =
+      spawn_monitor(fn ->
+        case new(opts) do
+          {:ok, spool} ->
+            send(parent, {self(), {:ok, spool}})
+            feed_spool(enum, spool, len)
+
+          {:error, _} = err ->
+            send(parent, {self(), err})
+        end
+      end)
+
+    receive do
+      {^writer, {:ok, spool}} ->
+        Process.demonitor(mon, [:flush])
+        {:ok, spool, writer}
+
+      {^writer, {:error, _} = err} ->
+        Process.demonitor(mon, [:flush])
+        err
+
+      {:DOWN, ^mon, :process, ^writer, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Zero-length: finalize WITHOUT pulling the enum (a blocking empty stream
+  # would otherwise deadlock readers at EOF).
+  defp feed_spool(_enum, spool, 0), do: finalize(spool)
+
+  defp feed_spool(enum, spool, len) when len > 0 do
+    try do
+      enum
+      |> Enum.reduce_while(0, fn iodata, written ->
+        case IO.iodata_to_binary(iodata) do
+          "" ->
+            {:cont, written}   # skip empty chunks (no-op write; avoids pathological spins)
+
+          bin ->
+            case write(spool, bin) do
+              :ok ->
+                case written + byte_size(bin) do
+                  ^len -> finalize(spool); {:halt, :filled}
+                  n -> {:cont, n}
+                end
+
+              {:error, _} ->
+                {:halt, :stopped}
+            end
+        end
+      end)
+      |> case do
+        :filled -> :ok
+        :stopped -> :ok
+        n when is_integer(n) -> finalize(spool)  # enum ended early -> {:error, :short}
+      end
+    rescue
+      _ -> abort(spool)
+    catch
+      _, _ -> abort(spool)
+    end
+  end
+
   @doc false
   def default_max_bytes,
     do: Application.get_env(:vix, :source_spool_max_bytes, @default_max_bytes)
