@@ -19,6 +19,10 @@
 #define ECANCELED EIO
 #endif
 
+/* Per-slice copy bound. write/2 holds buf->lock during each slice's memcpy and releases it between
+   slices, so this caps how long a reader can wait behind one write copy; read_cb uses it to cap a
+   single memcpy. 256 KiB is a throughput/latency compromise — lower it for tighter read latency
+   under heavy writes. */
 #define SPOOL_MAX_SLICE ((size_t)(256 * 1024))
 
 static ErlNifResourceType *SPOOL_BUF_RT;
@@ -240,8 +244,11 @@ ERL_NIF_TERM nif_source_spool_write(ErlNifEnv *env, int argc,
       return make_error_term(env, make_atom(env, "aborted"));
     }
 
-    /* would this binary exceed the declared length? (size <= content_length) */
-    if ((gint64)(bin.size - off) > b->content_length - b->size) {
+    /* would this binary exceed the declared length? `remaining` is >= 0 by invariant
+       (size <= content_length), so compare as unsigned and avoid casting a potentially
+       huge size_t (bin.size - off) to a signed gint64. */
+    gint64 remaining = b->content_length - b->size;
+    if ((guint64)(bin.size - off) > (guint64)remaining) {
       spool_set_terminal_locked(b, SPOOL_ABORTED, SPOOL_REASON_OVERFLOW, EFBIG);
       enif_mutex_unlock(b->lock);
       return make_error_term(env, make_atom(env, "overflow"));
@@ -460,12 +467,18 @@ ERL_NIF_TERM nif_source_spool_source(ErlNifEnv *env, int argc,
   if (!b) /* mirror new/write/finalize/abort guards */
     return make_error_term(env, make_atom(env, "aborted"));
 
+  /* Multiple sources may be created from one spool — each gets an independent read cursor over the
+     shared buffer (this is the reopen / parallel-decode path). Reject only if already aborted; a
+     concurrent abort right after this check is fine (the returned source fails on first read). */
   enif_mutex_lock(b->lock);
-  if (b->state == SPOOL_ABORTED) {
-    enif_mutex_unlock(b->lock);
+  int aborted = b->state == SPOOL_ABORTED;
+  enif_mutex_unlock(b->lock);
+  if (aborted)
     return make_error_term(env, make_atom(env, "aborted"));
-  }
-  enif_keep_resource(b); /* this reader's ref */
+
+  /* b stays alive via wr for the call; this keep gives the reader its own independent ref so the
+     buffer outlives wr. No lock needed for the refcount op. */
+  enif_keep_resource(b);
   enif_mutex_unlock(b->lock);
 
   SpoolReader *r = enif_alloc(sizeof(SpoolReader));
