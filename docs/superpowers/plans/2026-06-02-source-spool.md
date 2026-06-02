@@ -12,13 +12,10 @@
 
 ## Prerequisites
 
-- [ ] **Base the implementation branch on `my-fixes`** (or merge it first). It carries two C fixes this plan relies on rather than re-deriving:
-  - `vix.c`: `nif_vips_tracked_get_mem_highwater` bound to the correct function (a copy-paste registration bug — the cautionary tale for Task 6's table edits).
-  - `pipe.c`: `fd_rt_stop` closes the fd on owner exit. We don't copy that callback (no `enif_select` here), but it confirms the rule we follow: **owner-exit cleanup must happen in the monitor path, not be deferred to GC.**
+- [ ] **(Recommended, not required) Merge `my-fixes` first.** The spool is all-new code and compiles green on plain HEAD — `spool.c` references no pipe symbol and none of `my-fixes`'s changes — so this is *not* a hard gate. But `my-fixes` corrects a real pre-existing bug worth having in the tree: `vix.c` binds `nif_vips_tracked_get_mem_highwater` to the wrong function (`nif_vips_tracked_get_mem`) — the copy-paste registration typo that is the **cautionary tale for Task 6's table edits**. (HEAD already has `pipe.c`'s `fd_rt_stop`/`fd_rt_down`; `my-fixes` only adds a 2-line `pipe.c` tweak + a regression test there — nothing the spool depends on.)
 
-  Verify it's present:
   ```bash
-  git merge-base --is-ancestor my-fixes HEAD && echo "my-fixes present" || echo "MERGE my-fixes FIRST"
+  git merge-base --is-ancestor my-fixes HEAD && echo "present" || echo "not merged — fine to proceed; spool is self-contained"
   ```
 
 ## Design invariants this plan must preserve
@@ -177,6 +174,7 @@ static void spool_buf_dtor(ErlNifEnv *env, void *obj) {
 static void spool_write_dtor(ErlNifEnv *env, void *obj) {
   SpoolWriteHandle *wr = (SpoolWriteHandle *)obj;
   if (wr->buf) {
+    enif_demonitor_process(env, wr, &wr->mon);         /* explicit; harmless if auto-removed */
     spool_set_terminal(wr->buf, SPOOL_ABORTED, EPIPE); /* backstop if still OPEN */
     enif_release_resource(wr->buf);                    /* outside any lock */
     wr->buf = NULL;
@@ -225,9 +223,13 @@ ERL_NIF_TERM nif_source_spool_new(ErlNifEnv *env, int argc,
     return make_error(env, "content_length must be an integer");
   if (content_length < 0)
     return make_error_term(env, make_atom(env, "invalid_content_length"));
-  /* gint64 max < SIZE_MAX on 64-bit; matters on 32-bit builds */
+  /* On 32-bit builds gint64 can exceed SIZE_MAX; on 64-bit the compare is
+     tautological, so guard it or clang rejects it under -Wextra -Werror
+     (-Wtautological-constant-out-of-range-compare). */
+#if SIZE_MAX < INT64_MAX
   if ((guint64)content_length > (guint64)SIZE_MAX)
     return make_error_term(env, make_atom(env, "content_length_too_large"));
+#endif
 
   SpoolBuf *buf = enif_alloc_resource(SPOOL_BUF_RT, sizeof(SpoolBuf));
   buf->lock = NULL;
@@ -311,7 +313,8 @@ ERL_NIF_TERM nif_source_spool_abort(ErlNifEnv *env, int argc,
   SpoolWriteHandle *wr;
   if (!enif_get_resource(env, argv[0], SPOOL_WRITE_RT, (void **)&wr))
     return make_error(env, "invalid spool handle");
-  spool_set_terminal(wr->buf, SPOOL_ABORTED, ECANCELED);
+  if (wr->buf) /* NULL only after the dtor ran; defensive */
+    spool_set_terminal(wr->buf, SPOOL_ABORTED, ECANCELED);
   return ATOM_OK;
 }
 ```
@@ -498,7 +501,7 @@ git commit -m "feat(spool): resource types + new/finalize/abort lifecycle"
 
 - [ ] **Step 2: Run, expect failure**
 
-Run: `mix test test/vix/source_spool_test.exs -k "write/2"`
+Run: `mix test test/vix/source_spool_test.exs`
 Expected: FAIL — `SourceSpool.write/2` undefined.
 
 - [ ] **Step 3: Add `nif_source_spool_write` to `c_src/spool.c`** (after `nif_source_spool_new`):
@@ -644,10 +647,20 @@ on the Task 6 Image integration.
 
 - [ ] **Step 3: Run, expect failure**
 
-Run: `mix test test/vix/source_spool_test.exs -k "source/1 over a fully"`
+Run: `mix test test/vix/source_spool_test.exs`
 Expected: FAIL — `SourceSpool.source/1` undefined.
 
 - [ ] **Step 4: Add callbacks + `source/1` to `c_src/spool.c`** (after `nif_source_spool_abort`):
+
+> **VERIFY FIRST (the one unverifiable-from-the-plan risk):** `G_CALLBACK` casts away the handler
+> prototype, so a mismatch between `spool_read_cb`/`spool_seek_cb` and the actual libvips
+> `VipsSourceCustom` `"read"`/`"seek"` signal signatures compiles clean and corrupts the stack at
+> decode time. Before trusting the signatures below, open the header you compile against —
+> `priv/precompiled_libvips/include/vips/sourcecustom.h` (populated after the first `mix compile`) —
+> and confirm `VipsSourceCustomReadSignal` is `gint64 (*)(VipsSourceCustom *, void *buffer, gint64 length, gpointer)`
+> and `VipsSourceCustomSeekSignal` is `gint64 (*)(VipsSourceCustom *, gint64 offset, int whence, gpointer)`.
+> Match the parameter order/types/return verbatim. The Task 3 JPEG decode is the smoke test: if the
+> ABI is wrong it crashes or returns garbage there.
 
 ```c
 /* Owns the SpoolReader; the single GObject destroy notify (no per-signal free). */
@@ -829,6 +842,9 @@ Proves a reader **blocks** until bytes arrive and that killing the writer proces
 - [ ] **Step 1: Write the failing/again-green test** — append:
 
 ```elixir
+  # Liveness tests deadlock the VM if the C monitor/condvar wiring is wrong;
+  # bound them so a regression fails fast instead of hanging the suite.
+  @tag timeout: 10_000
   test "a reader blocks at the frontier and a concurrent writer unblocks it" do
     bytes = File.read!(img_path("puppies.jpg"))
     half = div(byte_size(bytes), 2)
@@ -854,6 +870,7 @@ Proves a reader **blocks** until bytes arrive and that killing the writer proces
     _ = decoder
   end
 
+  @tag timeout: 10_000
   test "killing the writer wakes a parked reader with an error" do
     bytes = File.read!(img_path("puppies.jpg"))
 
@@ -883,8 +900,8 @@ Proves a reader **blocks** until bytes arrive and that killing the writer proces
 
 - [ ] **Step 2: Run, expect pass (C already supports this)**
 
-Run: `mix test test/vix/source_spool_test.exs -k "frontier"`
-Run: `mix test test/vix/source_spool_test.exs -k "killing the writer"`
+Run: `mix test test/vix/source_spool_test.exs`
+Run: `mix test test/vix/source_spool_test.exs`
 Expected: PASS. If the second hangs, the monitor/down wiring from Task 1 is wrong — revisit `spool_write_down` and the `enif_monitor_process` call.
 
 - [ ] **Step 3: Commit**
@@ -922,6 +939,7 @@ Adds the monitor-safe `Enumerable` feeder: `spawn_monitor`, exact-fill finalize,
       assert Image.width(img) > 0
     end
 
+    @tag timeout: 10_000
     test "finalizes at exactly content_length without pulling an extra (blocking) item" do
       bytes = File.read!(img_path("puppies.jpg"))
       # An enum that yields the whole body, then BLOCKS forever if pulled again.
@@ -951,7 +969,7 @@ Adds the monitor-safe `Enumerable` feeder: `spawn_monitor`, exact-fill finalize,
 
 - [ ] **Step 2: Run, expect failure**
 
-Run: `mix test test/vix/source_spool_test.exs -k "start_feeder"`
+Run: `mix test test/vix/source_spool_test.exs`
 Expected: FAIL — `SourceSpool.start_feeder/2` undefined.
 
 - [ ] **Step 3: Implement in `lib/vix/source_spool.ex`** — add public `start_feeder/2` and private `feed_spool/3`:
@@ -1024,7 +1042,7 @@ Expected: FAIL — `SourceSpool.start_feeder/2` undefined.
 
 - [ ] **Step 4: Compile and run, expect pass**
 
-Run: `mix compile && mix test test/vix/source_spool_test.exs -k "start_feeder"`
+Run: `mix compile && mix test test/vix/source_spool_test.exs`
 Expected: PASS — in particular the exact-fill test must finish (proving finalize happens without the extra blocking pull).
 
 - [ ] **Step 5: Commit**
@@ -1080,7 +1098,7 @@ Wires the spool into the public image API and proves parity with `new_from_file`
 
 - [ ] **Step 2: Run, expect failure**
 
-Run: `mix test test/vix/vips/image_test.exs -k "new_from_enum seekable"`
+Run: `mix test test/vix/vips/image_test.exs`
 Expected: FAIL — `seekable:` not handled (decodes via the pipe path or errors).
 
 - [ ] **Step 3: Modify `lib/vix/vips/image.ex`** — make `new_from_enum/2` dispatch. Rename the existing body to `new_from_enum_pipe/2` and add the seekable branch. At the top of the module ensure the aliases exist (`Vix.SourceSpool`, `Vix.Vips.Foreign`, `Vix.Vips.Operation.Helper` are already used by the pipe path).
@@ -1109,6 +1127,7 @@ Replace the `def new_from_enum(enum, opts \\ []) do … end` head ([image.ex:701
     {max, opts} = Keyword.pop(opts, :max_bytes, Vix.SourceSpool.default_max_bytes())
 
     with :ok <- validate_spool_length(len, max),
+         :ok <- validate_options(opts),    # parity with the pipe path (validate_options is defp here)
          {:ok, spool, _writer} <-
            Vix.SourceSpool.start_feeder(enum, content_length: len, max_bytes: max) do
       watchdog = timeout && start_spool_watchdog(spool, timeout)
@@ -1156,11 +1175,11 @@ Replace the `def new_from_enum(enum, opts \\ []) do … end` head ([image.ex:701
   end
 ```
 
-> Note: copy the original `new_from_enum/2` body verbatim into `new_from_enum_pipe/2`. Do not change pipe behavior. Confirm `wrap_type/1`, `validate_options/1`, `Foreign`, and `Operation.Helper` are the same references the original body used.
+> Note: copy the original `new_from_enum/2` body verbatim into `new_from_enum_pipe/2`. Do not change pipe behavior. Confirm `wrap_type/1`, `validate_options/1`, `Foreign`, and `Operation.Helper` are the same references the original body used. **Keep the `\\ []` default arg ONLY on the public `new_from_enum/2` head** — do not carry it onto the private `new_from_enum_pipe/2` or `new_from_enum_spool/2` clauses.
 
 - [ ] **Step 4: Compile and run, expect pass**
 
-Run: `mix compile && mix test test/vix/vips/image_test.exs -k "new_from_enum"`
+Run: `mix compile && mix test test/vix/vips/image_test.exs`
 Expected: PASS — all three formats match `new_from_file`; missing-length errors. Run the full file too: `mix test test/vix/vips/image_test.exs` (the pipe-path tests must still pass).
 
 - [ ] **Step 5: Commit**
@@ -1211,8 +1230,8 @@ Proves `source/1` mints independent cursors over one buffer, that the seek-heavy
 
 - [ ] **Step 2: Run, expect pass**
 
-Run: `mix test test/vix/source_spool_test.exs -k "independent sources"`
-Run: `mix test test/vix/source_spool_test.exs -k "registered"`
+Run: `mix test test/vix/source_spool_test.exs`
+Run: `mix test test/vix/source_spool_test.exs`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
@@ -1234,28 +1253,32 @@ The two release-blocking C assumptions from the design: the returned lazy image 
 - [ ] **Step 1: Write the lazy-lifetime test** — append:
 
 ```elixir
-  test "a lazy image stays valid after its source term is GC'd" do
+  test "image retains its source: buffer survives GC of BOTH the spool handle and the source term" do
     bytes = File.read!(img_path("puppies.jpg"))
-    {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
-    :ok = SourceSpool.write(spool, bytes)
-    :ok = SourceSpool.finalize(spool)
 
+    # Create the spool handle AND the source inside the closure, so after it returns the ONLY
+    # path keeping the buffer alive is the image retaining the source. If the load op did not
+    # retain it, the buffer would be freed and the eval below would use-after-free.
     img =
       (fn ->
+         {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+         :ok = SourceSpool.write(spool, bytes)
+         :ok = SourceSpool.finalize(spool)
          {:ok, source} = SourceSpool.source(spool)
          {:ok, img} = decode_source(source)
          img
        end).()
 
     :erlang.garbage_collect()
-    # Force real pixel evaluation AFTER the local `source` term is gone.
+    # Definitive UAF detection is the valgrind/ASan run in Step 3 (GC + Janitor unref is async,
+    # so a clean pass here is necessary-but-not-sufficient).
     assert {:ok, _bin} = Image.write_to_buffer(img, ".png")
   end
 ```
 
 - [ ] **Step 2: Run, expect pass**
 
-Run: `mix test test/vix/source_spool_test.exs -k "stays valid after"`
+Run: `mix test test/vix/source_spool_test.exs`
 Expected: PASS. If it crashes the VM, the load op is not retaining the source — pin it (design "Returned lazy image retains its source"): in `nif_source_spool_source` the GObject resource must outlive the image, which it does only if libvips holds its own ref; if not, attach the source to the image. Investigate before proceeding.
 
 - [ ] **Step 3: Run the full spool + image suites under valgrind (Linux) to catch double-free / leaks**
@@ -1277,11 +1300,127 @@ git commit -m "test(spool): lazy-image source retention + memory-checker pass"
 
 ---
 
+## Task 9: Design-mandated safety & liveness tests
+
+The design names several behaviors as must-test (monitor ownership through `start_feeder`, the
+`spawn_monitor` payoff, `:short`, the watchdog, abort responsiveness, the SEEK_END length-cache).
+The earlier tasks prove the *mechanisms*; these pin the *contracts* the design called out. All
+test-only.
+
+**Files:**
+- Test: `test/vix/source_spool_test.exs` (tests 1–3, 5, 6)
+- Test: `test/vix/vips/image_test.exs` (test 4)
+
+- [ ] **Step 1: Add the contract tests** to `test/vix/source_spool_test.exs`:
+
+```elixir
+  # Helper: an enum that yields nothing and blocks forever if pulled.
+  defp blocking_enum,
+    do: Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
+
+  # (1) The design's "single most important contract": start_feeder makes the FEEDER the
+  # monitored writer. Killing the feeder (not the test process) must wake a parked reader.
+  @tag timeout: 10_000
+  test "start_feeder monitors the feeder: killing it wakes a parked reader" do
+    {:ok, spool, writer} =
+      SourceSpool.start_feeder(blocking_enum(), content_length: 1000)
+
+    {:ok, source} = SourceSpool.source(spool)
+    parent = self()
+    _decoder = spawn_link(fn -> send(parent, {:res, decode_source(source)}) end)
+
+    Process.sleep(50)            # decoder parks at the frontier (nothing written yet)
+    Process.exit(writer, :kill)  # feeder is the monitored writer
+    assert_receive {:res, {:error, _}}, 5_000
+  end
+
+  # (2) The spawn_monitor payoff: a feeder :kill surfaces as an API error, never crashes the
+  # caller — even when the caller traps exits.
+  @tag timeout: 10_000
+  test "a feeder :kill does not crash the caller; the spool reports :aborted" do
+    Process.flag(:trap_exit, true)
+    {:ok, spool, writer} = SourceSpool.start_feeder(blocking_enum(), content_length: 1000)
+    Process.exit(writer, :kill)
+    Process.sleep(50)
+    assert {:error, :aborted} = SourceSpool.source(spool)  # caller still alive & usable
+  after
+    Process.flag(:trap_exit, false)
+  end
+
+  # (3) Short stream: finalize before content_length aborts with :short.
+  test "finalize before content_length returns :short" do
+    {:ok, spool} = SourceSpool.new(content_length: 10)
+    :ok = SourceSpool.write(spool, "abc")
+    assert {:error, :short} = SourceSpool.finalize(spool)
+  end
+
+  # (5) Abort responsiveness: abort concurrent with a large multi-slice write must not deadlock.
+  # (The "stops within ~one SPOOL_MAX_SLICE" property is structural — verify by reading the
+  # lock-per-slice loop; this test guards against a deadlock regression.)
+  @tag timeout: 10_000
+  test "abort/1 concurrent with a large write does not deadlock" do
+    big = :binary.copy("x", 8 * 1024 * 1024)
+    {:ok, spool} = SourceSpool.new(content_length: byte_size(big))
+    spawn(fn -> SourceSpool.abort(spool) end)
+    assert SourceSpool.write(spool, big) in [:ok, {:error, :aborted}]
+  end
+
+  # (6) SEEK_END length-cache pin. A TIFF loader probes source length early (SEEK_END). Feeding a
+  # TIFF in two halves and decoding correctly proves SEEK_END returns content_length, NOT the
+  # write frontier — the exact bug the content_length requirement defends against. (A truly direct
+  # seek-callback unit test isn't possible from Elixir; this end-to-end shape is the real pin.)
+  @tag timeout: 10_000
+  test "TIFF fed incrementally decodes — SEEK_END returns content_length, not the frontier" do
+    bytes = File.read!(img_path("boats.tif"))
+    half = div(byte_size(bytes), 2)
+    <<first::binary-size(half), rest::binary>> = bytes
+
+    {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+    {:ok, source} = SourceSpool.source(spool)
+    parent = self()
+    _decoder = spawn_link(fn -> send(parent, {:res, decode_source(source)}) end)
+
+    :ok = SourceSpool.write(spool, first)
+    :ok = SourceSpool.write(spool, rest)
+    :ok = SourceSpool.finalize(spool)
+    assert_receive {:res, {:ok, _img}}, 5_000
+  end
+```
+
+- [ ] **Step 2: Add the watchdog test** to `test/vix/vips/image_test.exs` (inside the `new_from_enum seekable` describe):
+
+```elixir
+    # (4) :timeout watchdog — the ONLY liveness mechanism for a live-but-stalled producer (the
+    # monitor only fires on death). A stalled feeder must yield {:error,_}, not hang.
+    @tag timeout: 10_000
+    test "seekable :timeout aborts a stalled feeder instead of hanging" do
+      enum = Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
+
+      assert {:error, _} =
+               Image.new_from_enum(enum, seekable: true, content_length: 1000, timeout: 300)
+    end
+```
+
+- [ ] **Step 3: Run, expect pass** (the C/Elixir from Tasks 1–6 already implement these behaviors):
+
+Run: `mix test test/vix/source_spool_test.exs test/vix/vips/image_test.exs`
+Expected: PASS. A *hang* (not a clean failure) in test 1, 2, or 4 means the monitor/watchdog wiring is wrong — revisit Task 1's `spool_write_down`/`enif_monitor_process` or Task 6's `start_spool_watchdog`.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add test/vix/source_spool_test.exs test/vix/vips/image_test.exs
+git commit -m "test(spool): pin monitor-ownership, spawn_monitor, :short, watchdog, SEEK_END"
+```
+
+---
+
 ## Self-review notes (author)
 
 **Spec coverage check** — every design section maps to a task:
 - Push-not-pull boundary, callbacks native-only → Task 3 (`read_cb`/`seek_cb` touch no env/terms).
-- `content_length` required + stable `SEEK_END` → Task 3 (`seek_cb` returns `content_length`), Task 6 (`content_length_required`); the length-cache regression is implicitly exercised by the seek-heavy decodes in Tasks 3/6/7 (a poisoned length would break the TIFF/JPEG decode). A dedicated `SEEK_END`-before-finalize assertion is folded into the Task 4 frontier test.
+- `content_length` required + stable `SEEK_END` → Task 3 (`seek_cb` returns `content_length`), Task 6 (`content_length_required`); the length-cache regression is **directly pinned** by Task 9 test 6 (TIFF fed in two halves — SEEK_END must return `content_length`, not the frontier).
+- Monitor-ownership through `start_feeder`, the `spawn_monitor` no-caller-crash payoff, `:short`, the `:timeout` watchdog, abort-no-deadlock → Task 9 (the design's named must-test contracts).
 - Pre-allocated `SpoolBuf`, refcount via resource → Task 1.
 - Lock-per-slice write → Task 2.
 - `source/1` cursor split, single destroy notify → Task 3.
@@ -1293,6 +1432,10 @@ git commit -m "test(spool): lazy-image source retention + memory-checker pass"
 
 **Deferred (design "Deferred (not v1)")** — intentionally not tasked: lock-free reads, decode-owner cancellation, forwarding stream exceptions, `iodata` write contract.
 
-**Known coverage gaps to revisit if time allows** (not blockers): overlap instrumentation across HEIF/AVIF (no HEIF/AVIF fixtures in `test/images` — TIFF stands in for seek-heavy); dirty-scheduler stress test; hot-upgrade NIF-unload test.
+**Known coverage gaps** (acknowledged, not blockers):
+- **HEIF/AVIF overlap instrumentation** — no HEIF/AVIF fixtures in `test/images`; TIFF stands in for seek-heavy. Since the *headline goal* is seek-heavy HEIF/AVIF overlap, this leaves the primary value proposition measured only by proxy. **Decision needed** (see below) on whether to add fixtures before claiming the goal.
+- **NIF-unload / function-pointer safety on hot upgrade** — the design lists this as release-blocking. It is addressed structurally (the `VipsSourceCustom` is a BEAM resource via `g_object_to_erl_term`, which pins the library) but not exercised by a load/purge test; the valgrind run (Task 8 Step 3) is the practical backstop. A true hot-upgrade test needs a harness this project doesn't have.
+- **Direct `read_cb`/`seek_cb` defensive-input cases** (NULL buffer, negative length, invalid whence) — not emittable from Elixir without a C test harness; covered by code review + the decode paths that exercise the normal branches.
+- **monitor↔dtor failure injection** — hardened with `enif_demonitor_process` in the write dtor (Task 1) + the valgrind run; a deterministic ExUnit test isn't feasible (resource-dtor timing is async).
 
 **Type/name consistency** — NIF names match across `spool.h`, `spool.c`, `vix.c` table, and `nif.ex` stubs: `nif_source_spool_{new,write,finalize,abort,source}`. Elixir surface: `SourceSpool.{new/1,write/2,finalize/1,abort/1,source/1,start_feeder/2}`. Error atoms: `:content_length_required`, `:invalid_content_length`, `:content_length_too_large`, `:not_owner`, `:closed`, `:aborted`, `:overflow`, `:short`, `:enomem`.
