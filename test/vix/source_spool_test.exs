@@ -76,4 +76,59 @@ defmodule Vix.SourceSpoolTest do
     {:ok, img} = decode_source(source)
     assert {Image.width(img), Image.height(img), Image.bands(img)} == expected
   end
+
+  # Liveness tests deadlock the VM if the C monitor/condvar wiring is wrong;
+  # bound them so a regression fails fast instead of hanging the suite.
+  @tag timeout: 10_000
+  test "a reader blocks at the frontier and a concurrent writer unblocks it" do
+    bytes = File.read!(img_path("puppies.jpg"))
+    half = div(byte_size(bytes), 2)
+    <<first::binary-size(half), rest::binary>> = bytes
+
+    {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+    {:ok, source} = SourceSpool.source(spool)
+
+    # Decode in a separate process; it will block reading past `first`.
+    parent = self()
+    decoder = spawn_link(fn ->
+      {:ok, img} = decode_source(source)
+      send(parent, {:decoded, Image.width(img), Image.height(img)})
+    end)
+
+    :ok = SourceSpool.write(spool, first)
+    refute_received {:decoded, _, _}          # still blocked at the frontier
+    :ok = SourceSpool.write(spool, rest)
+    :ok = SourceSpool.finalize(spool)
+
+    assert_receive {:decoded, w, h}, 5_000
+    assert w > 0 and h > 0
+    _ = decoder
+  end
+
+  @tag timeout: 10_000
+  test "killing the writer wakes a parked reader with an error" do
+    bytes = File.read!(img_path("puppies.jpg"))
+
+    parent = self()
+    # The writer process owns the spool; it sends the source out, then parks.
+    writer = spawn(fn ->
+      {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+      {:ok, source} = SourceSpool.source(spool)
+      send(parent, {:source, source})
+      Process.sleep(:infinity)   # never writes; dies on kill below
+    end)
+
+    source = receive do {:source, s} -> s after 1_000 -> flunk("no source") end
+
+    decoder = spawn_link(fn ->
+      result = decode_source(source)
+      send(parent, {:decode_result, result})
+    end)
+
+    Process.sleep(50)            # let the decoder park at the frontier
+    Process.exit(writer, :kill)  # monitor-down -> ABORTED -> reader wakes
+
+    assert_receive {:decode_result, {:error, _}}, 5_000
+    _ = decoder
+  end
 end
