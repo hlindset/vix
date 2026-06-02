@@ -309,4 +309,67 @@ defmodule Vix.SourceSpoolTest do
     # so a clean pass here is necessary-but-not-sufficient).
     assert {:ok, _bin} = Image.write_to_buffer(img, ".png")
   end
+
+  # ---- concurrent (parallel) decode from one spool ----
+
+  # Several sources over one FINALIZED spool, decoded simultaneously (independent cursors,
+  # shared buffer under one lock). Uses a seek-heavy TIFF to exercise concurrent seeks.
+  @tag timeout: 15_000
+  test "multiple sources decode one spool concurrently" do
+    {:ok, ref} = Image.new_from_file(img_path("boats.tif"))
+    expected = {Image.width(ref), Image.height(ref)}
+    bytes = File.read!(img_path("boats.tif"))
+
+    {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+    :ok = SourceSpool.write(spool, bytes)
+    :ok = SourceSpool.finalize(spool)
+
+    tasks =
+      for _ <- 1..4 do
+        {:ok, source} = SourceSpool.source(spool)
+
+        Task.async(fn ->
+          {:ok, img} = decode_source(source)
+          {Image.width(img), Image.height(img)}
+        end)
+      end
+
+    assert Enum.all?(Task.await_many(tasks, 12_000), &(&1 == expected))
+  end
+
+  # Overlap: parallel decoders park at the frontier on a spool that is NOT yet filled, then the
+  # writer feeds in chunks. The condvar broadcast must wake all parked readers and each must
+  # complete with the correct image.
+  @tag timeout: 15_000
+  test "parallel decoders over a still-filling spool all complete (overlap)" do
+    {:ok, ref} = Image.new_from_file(img_path("boats.tif"))
+    expected = {Image.width(ref), Image.height(ref)}
+    bytes = File.read!(img_path("boats.tif"))
+    total = byte_size(bytes)
+
+    {:ok, spool} = SourceSpool.new(content_length: total)
+
+    # Mint sources and start decoders BEFORE any bytes are written — they park at the frontier.
+    tasks =
+      for _ <- 1..3 do
+        {:ok, source} = SourceSpool.source(spool)
+
+        Task.async(fn ->
+          {:ok, img} = decode_source(source)
+          {Image.width(img), Image.height(img)}
+        end)
+      end
+
+    Process.sleep(50)
+
+    chunk = 16_384
+
+    for offset <- 0..(total - 1)//chunk do
+      :ok = SourceSpool.write(spool, binary_part(bytes, offset, min(chunk, total - offset)))
+    end
+
+    :ok = SourceSpool.finalize(spool)
+
+    assert Enum.all?(Task.await_many(tasks, 12_000), &(&1 == expected))
+  end
 end
