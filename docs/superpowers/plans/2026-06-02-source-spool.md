@@ -42,6 +42,8 @@ These come straight from the design's Concurrency model and Implementation check
 | `lib/vix/vips/image.ex` | Modify | `new_from_enum/2` `seekable: true` branch |
 | `test/vix/source_spool_test.exs` | Create | Spool unit + concurrency + lifetime tests |
 | `test/vix/vips/image_test.exs` | Modify | `new_from_enum` seekable integration tests |
+| `test/test_helper.exs` | Modify | Env-gate `:heif` tests (Task 10) |
+| `test/images/sample.heic`, `sample.avif` | Add | HEIF/AVIF fixtures (Task 10) |
 
 The `c_src/Makefile` needs **no change** — it auto-globs `*.c` ([Makefile:117](../../../c_src/Makefile)).
 
@@ -1415,6 +1417,77 @@ git commit -m "test(spool): pin monitor-ownership, spawn_monitor, :short, watchd
 
 ---
 
+## Task 10: HEIF/AVIF coverage (env-gated, temporary)
+
+The headline goal is seek-heavy HEIF/AVIF. These formats need a libvips built with libheif, which
+isn't guaranteed, so the tests are **excluded by default** and opt-in via `VIX_TEST_HEIF=1`.
+(Temporary mechanism — the eventual replacement is a runtime capability check that auto-skips.)
+
+**Files:**
+- Modify: `test/test_helper.exs` (env-gated exclude)
+- Add: `test/images/sample.heic`, `test/images/sample.avif` (small fixtures)
+- Test: `test/vix/vips/image_test.exs`
+
+- [ ] **Step 1: Gate `:heif`-tagged tests in `test/test_helper.exs`**
+
+The file is currently just `ExUnit.start()`. Replace with:
+
+```elixir
+# HEIF/AVIF tests need a libvips built with libheif. Excluded unless VIX_TEST_HEIF is set.
+# TEMPORARY: replace with a runtime capability check when HEIF coverage becomes permanent.
+heif = System.get_env("VIX_TEST_HEIF") not in [nil, "", "0", "false"]
+ExUnit.start(exclude: if(heif, do: [], else: [heif: true]))
+```
+
+- [ ] **Step 2: Add small fixtures** `test/images/sample.heic` and `test/images/sample.avif`.
+
+Generate from an existing fixture if your libvips has HEIF/AVIF **save** support:
+```bash
+vips copy test/images/puppies.jpg test/images/sample.heic
+vips copy test/images/puppies.jpg test/images/sample.avif
+```
+If it only has *load* support, source a small public sample instead. Keep them small (<200 KB) and `git add` them.
+
+- [ ] **Step 3: Add the gated tests** to `test/vix/vips/image_test.exs` (inside the `new_from_enum seekable` describe; `chunked/1` is defined there from Task 6):
+
+```elixir
+    for name <- ["sample.heic", "sample.avif"] do
+      @tag :heif
+      @tag timeout: 10_000
+      test "decodes #{name} fed incrementally (seekable)" do
+        path = img_path(unquote(name))
+        # Clear opt-in failure if VIX_TEST_HEIF is set but the format isn't actually supported.
+        case Vix.Vips.Foreign.find_load(path) do
+          {:ok, _} -> :ok
+          _ -> flunk("VIX_TEST_HEIF set but libvips cannot load #{unquote(name)}")
+        end
+
+        {:ok, ref} = Image.new_from_file(path)
+        {enum, len} = chunked(path)
+
+        assert {:ok, img} =
+                 Image.new_from_enum(enum, seekable: true, content_length: len)
+
+        assert {Image.width(img), Image.height(img)} ==
+                 {Image.width(ref), Image.height(ref)}
+      end
+    end
+```
+
+- [ ] **Step 4: Run gated; expect pass when opted in**
+
+Default (excluded): `mix test test/vix/vips/image_test.exs` — the `:heif` tests are skipped.
+Opted in: `VIX_TEST_HEIF=1 mix test test/vix/vips/image_test.exs` — they run and decode HEIF/AVIF via the seekable spool. If your libvips lacks HEIF support, they `flunk` with a clear message rather than a cryptic decode error.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add test/test_helper.exs test/images/sample.heic test/images/sample.avif test/vix/vips/image_test.exs
+git commit -m "test(spool): env-gated HEIF/AVIF seekable decode (VIX_TEST_HEIF)"
+```
+
+---
+
 ## Self-review notes (author)
 
 **Spec coverage check** — every design section maps to a task:
@@ -1433,7 +1506,7 @@ git commit -m "test(spool): pin monitor-ownership, spawn_monitor, :short, watchd
 **Deferred (design "Deferred (not v1)")** — intentionally not tasked: lock-free reads, decode-owner cancellation, forwarding stream exceptions, `iodata` write contract.
 
 **Known coverage gaps** (acknowledged, not blockers):
-- **HEIF/AVIF overlap instrumentation** — no HEIF/AVIF fixtures in `test/images`; TIFF stands in for seek-heavy. Since the *headline goal* is seek-heavy HEIF/AVIF overlap, this leaves the primary value proposition measured only by proxy. **Decision needed** (see below) on whether to add fixtures before claiming the goal.
+- **HEIF/AVIF decode** — covered by Task 10 behind the `VIX_TEST_HEIF` env gate (temporary, since libheif support isn't guaranteed in the linked libvips). Overlap *instrumentation* (measuring whether the loader streams vs maps) is still deferred — Task 10 proves correctness, not the overlap win.
 - **NIF-unload / function-pointer safety on hot upgrade** — the design lists this as release-blocking. It is addressed structurally (the `VipsSourceCustom` is a BEAM resource via `g_object_to_erl_term`, which pins the library) but not exercised by a load/purge test; the valgrind run (Task 8 Step 3) is the practical backstop. A true hot-upgrade test needs a harness this project doesn't have.
 - **Direct `read_cb`/`seek_cb` defensive-input cases** (NULL buffer, negative length, invalid whence) — not emittable from Elixir without a C test harness; covered by code review + the decode paths that exercise the normal branches.
 - **monitor↔dtor failure injection** — hardened with `enif_demonitor_process` in the write dtor (Task 1) + the valgrind run; a deterministic ExUnit test isn't feasible (resource-dtor timing is async).
