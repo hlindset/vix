@@ -47,10 +47,15 @@ These come straight from the design's Concurrency model and Implementation check
 
 The `c_src/Makefile` needs **no change** — it auto-globs `*.c` ([Makefile:117](../../../c_src/Makefile)).
 
-Build/test commands used throughout:
-- Recompile C + Elixir: `mix compile` (the Makefile rebuilds changed `.c`).
-- Run one test file: `mix test test/vix/source_spool_test.exs`
-- Run one test by line: `mix test test/vix/source_spool_test.exs:42`
+Build/test commands used throughout. **CRITICAL build mode:** the default
+`VIX_COMPILATION_MODE` (`PRECOMPILED_NIF_AND_LIBVIPS`) downloads a prebuilt `vix.so` and **ignores
+local `c_src/` changes** — your spool C silently won't take effect. Build/test with
+`VIX_COMPILATION_MODE=PRECOMPILED_LIBVIPS` (compiles local C against the already-fetched precompiled
+libvips). `mix test` also compiles, so prefix it too. `export VIX_COMPILATION_MODE=PRECOMPILED_LIBVIPS`
+once per shell is simplest. The command lines below omit the prefix for brevity — apply it everywhere.
+- Recompile C + Elixir: `VIX_COMPILATION_MODE=PRECOMPILED_LIBVIPS mix compile`
+- Run one test file: `VIX_COMPILATION_MODE=PRECOMPILED_LIBVIPS mix test test/vix/source_spool_test.exs`
+- Run one test by line: `… mix test test/vix/source_spool_test.exs:42`
 
 ---
 
@@ -183,7 +188,10 @@ static void spool_buf_dtor(ErlNifEnv *env, void *obj) {
 static void spool_write_dtor(ErlNifEnv *env, void *obj) {
   SpoolWriteHandle *wr = (SpoolWriteHandle *)obj;
   if (wr->buf) {
-    enif_demonitor_process(env, wr, &wr->mon);         /* explicit; harmless if auto-removed */
+    /* Do NOT enif_demonitor_process here: OTP auto-removes a resource's monitors
+       just before the dtor runs (and the writer-death `down` fires first), so calling
+       demonitor on the already-removed monitor faults teardown on OTP 29 (verified:
+       ethr_mutex_lock Invalid argument). pipe.c's dtor likewise never demonitors. */
     spool_set_terminal(wr->buf, SPOOL_ABORTED, EPIPE); /* backstop if still OPEN */
     enif_release_resource(wr->buf);                    /* outside any lock */
     wr->buf = NULL;
@@ -328,11 +336,12 @@ ERL_NIF_TERM nif_source_spool_abort(ErlNifEnv *env, int argc,
 }
 ```
 
-> **VERIFY (OTP monitor API):** confirm `enif_monitor_process(env, obj, pid, mon)` and
-> `enif_demonitor_process(env, obj, mon)` signatures against the OTP you build against — the 2nd arg
-> is the **resource object pointer** (`wr`), not a term, and the monitored object must be valid in
-> the down/dtor pairing. `pipe.c`'s `fd_to_erl_term` uses `enif_monitor_process` the same way; mirror
-> it. (Same class of "compiles-but-wrong" risk as the libvips signal note in Task 3.)
+> **VERIFIED (OTP monitor API):** `enif_monitor_process(env, obj, pid, mon)`'s 2nd arg is the
+> **resource object pointer** (`wr`), not a term. `pipe.c`'s `fd_to_erl_term` uses it the same way;
+> mirror it. **Do NOT call `enif_demonitor_process` in the write-handle dtor** — OTP auto-removes the
+> monitor before the dtor runs (and `down` fires first), so demonitoring there faults teardown on
+> OTP 29 (`ethr_mutex_lock: Invalid argument`); this was found and fixed during Task 1 implementation.
+> Rely on auto-removal, exactly as `pipe.c` does.
 
 - [ ] **Step 3: Wire into `c_src/vix.c`** — add the include with the other local headers (near [vix.c:11](../../../c_src/vix.c)):
 
@@ -1570,6 +1579,6 @@ git commit -m "test(spool): env-gated HEIF/AVIF seekable decode (VIX_TEST_HEIF)"
 - **HEIF/AVIF decode** — covered by Task 10 behind the `VIX_TEST_HEIF` env gate (temporary, since libheif support isn't guaranteed in the linked libvips). Overlap *instrumentation* (measuring whether the loader streams vs maps) is still deferred — Task 10 proves correctness, not the overlap win.
 - **NIF-unload / function-pointer safety on hot upgrade** — the design lists this as release-blocking. It is addressed structurally (the `VipsSourceCustom` is a BEAM resource via `g_object_to_erl_term`, which pins the library) but not exercised by a load/purge test; the valgrind run (Task 8 Step 3) is the practical backstop. A true hot-upgrade test needs a harness this project doesn't have.
 - **Direct `read_cb`/`seek_cb` defensive-input cases** (NULL buffer, negative length, invalid whence) — not emittable from Elixir without a C test harness; covered by code review + the decode paths that exercise the normal branches.
-- **monitor↔dtor failure injection** — hardened with `enif_demonitor_process` in the write dtor (Task 1) + the valgrind run; a deterministic ExUnit test isn't feasible (resource-dtor timing is async).
+- **monitor↔dtor failure injection** — relies on OTP's documented auto-removal of resource monitors before the dtor (verified during Task 1: explicit `enif_demonitor_process` in the dtor actually faults teardown on OTP 29, so it must NOT be used) + the valgrind run; a deterministic ExUnit test isn't feasible (resource-dtor timing is async).
 
 **Type/name consistency** — NIF names match across `spool.h`, `spool.c`, `vix.c` table, and `nif.ex` stubs: `nif_source_spool_{new,write,finalize,abort,source}`. Elixir surface: `SourceSpool.{new/1,write/2,finalize/1,abort/1,source/1,start_feeder/2}`. Error atoms: `:content_length_required`, `:invalid_content_length`, `:content_length_too_large`, `:not_owner`, `:closed`, `:aborted`, `:overflow`, `:short`, `:enomem`.
