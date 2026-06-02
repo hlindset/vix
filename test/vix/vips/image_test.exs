@@ -538,7 +538,8 @@ defmodule Vix.Vips.ImageTest do
       chunks = for <<c::binary-size(size) <- bytes>>, do: c
       used = length(chunks) * size
       tail = binary_part(bytes, used, byte_size(bytes) - used)
-      {chunks ++ [tail], byte_size(bytes)}
+      enum = if tail == "", do: chunks, else: chunks ++ [tail]
+      {enum, byte_size(bytes)}
     end
 
     for name <- ["puppies.jpg", "gradient.png", "boats.tif"] do
@@ -574,6 +575,31 @@ defmodule Vix.Vips.ImageTest do
     test "seekable rejects an invalid :timeout before doing any work" do
       assert {:error, :invalid_timeout} =
                Image.new_from_enum([<<>>], seekable: true, content_length: 1, timeout: 0)
+    end
+
+    # :timeout aborts a producer that stalls AFTER partial delivery — not only one that delivers
+    # nothing. A seek-heavy TIFF keeps its directory/strips at high offsets, so the loader blocks
+    # reading a position past the frontier that never arrives. The watchdog (tied to the feeder's
+    # lifetime, so it also covers reads triggered after new_from_enum/2 returns) must surface an
+    # error within ~timeout rather than hang. The underlying read error is our ECANCELED abort.
+    @tag timeout: 10_000
+    test "seekable :timeout aborts a producer that stalls mid-delivery" do
+      bytes = File.read!(img_path("boats.tif"))
+      total = byte_size(bytes)
+      half = binary_part(bytes, 0, div(total, 2))
+
+      enum =
+        Stream.resource(
+          fn -> :half end,
+          fn
+            :half -> {[half], :stall}
+            :stall -> Process.sleep(:infinity)
+          end,
+          fn _ -> :ok end
+        )
+
+      assert {:error, _} =
+               Image.new_from_enum(enum, seekable: true, content_length: total, timeout: 300)
     end
 
     for name <- ["sample.heic", "sample.avif"] do

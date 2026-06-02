@@ -1187,7 +1187,10 @@ Replace the `def new_from_enum(enum, opts \\ []) do … end` head ([image.ex:701
          :ok <- validate_options(opts),    # parity with the pipe path (validate_options is defp here)
          {:ok, spool, writer} <-
            Vix.SourceSpool.start_feeder(enum, content_length: len, max_bytes: max) do
-      watchdog = if timeout, do: start_spool_watchdog(spool, writer, timeout)
+      # Watchdog is tied to the FEEDER's lifetime (it monitors the feeder), not the load call —
+      # libvips images are lazy, so pixels may be pulled after this returns; bounding only the
+      # load call would leave lazy evaluation unprotected. Self-terminates when the feeder exits.
+      if timeout, do: start_spool_watchdog(spool, writer, timeout)
 
       try do
         with {:ok, source} <- Vix.SourceSpool.source(spool),
@@ -1204,8 +1207,6 @@ Replace the `def new_from_enum(enum, opts \\ []) do … end` head ([image.ex:701
         kind, reason ->
           Vix.SourceSpool.abort(spool)
           :erlang.raise(kind, reason, __STACKTRACE__)
-      after
-        if watchdog, do: send(watchdog, :done)
       end
     end
   end
@@ -1227,10 +1228,14 @@ Replace the `def new_from_enum(enum, opts \\ []) do … end` head ([image.ex:701
 
   # The watchdog both aborts the spool (wakes parked readers) AND kills the feeder.
   # Abort alone wakes readers but leaves a live-but-stalled producer blocked in the enum.
+  # Monitors the feeder so the timer covers the full producer lifetime (incl. lazy reads after
+  # new_from_enum/2 returns) and self-terminates the instant the feeder finalizes/aborts and exits.
   defp start_spool_watchdog(spool, writer, timeout) do
     spawn(fn ->
+      ref = Process.monitor(writer)
+
       receive do
-        :done -> :ok
+        {:DOWN, ^ref, :process, ^writer, _reason} -> :ok
       after
         timeout ->
           Vix.SourceSpool.abort(spool)

@@ -700,18 +700,39 @@ defmodule Vix.Vips.Image do
 
   By default the enumerable is fed through a read-once OS pipe, which cannot seek —
   seek-heavy formats (HEIF, AVIF, multi-page TIFF) may fail to decode. Passing
-  `seekable: true` instead spools the bytes into a native, seekable in-memory buffer
+  `seekable: true` spools the bytes into a native, seekable in-memory buffer
   (`Vix.SourceSpool`) that libvips can seek over while the data is still arriving.
 
-  This mode **requires** `content_length:` (the exact total byte size — a stable length
-  is mandatory for a seekable source) and accepts:
-
-    * `max_bytes:` - reject a declared `content_length` above this cap (defaults to a
-      library policy cap; set it when `content_length` comes from an untrusted source).
-    * `timeout:` - milliseconds after which a stalled producer is aborted instead of
-      hanging the decode.
-
       Image.new_from_enum(stream, seekable: true, content_length: byte_size)
+
+  Options:
+
+    * `content_length:` (**required**) - the exact total byte size. A stable length is
+      mandatory for a seekable source, so this mode cannot be used with unknown-length input.
+    * `max_bytes:` - reject a declared `content_length` larger than this. **Defaults to 100 MB**
+      (override globally with `config :vix, source_spool_max_bytes: bytes`, or per call). Existing
+      callers streaming bodies larger than 100 MB must raise this when flipping on `seekable: true`,
+      otherwise they get `{:error, :content_length_too_large}`. Set it deliberately when
+      `content_length` comes from an untrusted source such as a `Content-Length` header.
+    * `timeout:` - maximum milliseconds for the producer to deliver the full body. The deadline
+      covers the producer's whole lifetime, including reads triggered by lazy decoding *after* this
+      function returns; on expiry the source is aborted and the producer killed, so any pending or
+      later decode fails with an error rather than hanging. Without it, a stalled producer can hang
+      the decode indefinitely.
+
+  The entire input is held in RAM (`~content_length` bytes) for the lifetime of the decode. If the
+  producer raises, the decode fails with an aborted/error result — not the original exception (the
+  producer runs in a separate process).
+
+  ### Concurrency and resource limits
+
+  Each in-flight seekable decode holds `content_length` bytes resident **and** parks one dirty-IO
+  scheduler thread while it waits for bytes. Bound concurrency at the call site — Vix deliberately
+  does not, because the right limit depends on your RAM budget (`N × content_length`), the dirty-IO
+  scheduler pool (`+SDio`, default ~10), and libvips' own per-operation threads
+  (`Vix.Vips.concurrency_set/1`). For batches, gate with
+  `Task.async_stream(streams, fun, max_concurrency: System.schedulers_online() * 2, timeout: ...)`;
+  for a request path, a semaphore or worker pool gating entry into the decode.
 
   """
   @spec new_from_enum(Enumerable.t(), String.t() | keyword) :: {:ok, t()} | {:error, term()}
@@ -776,7 +797,12 @@ defmodule Vix.Vips.Image do
          :ok <- validate_options(opts),
          {:ok, spool, writer} <-
            Vix.SourceSpool.start_feeder(enum, content_length: len, max_bytes: max) do
-      watchdog = if timeout, do: start_spool_watchdog(spool, writer, timeout)
+      # The watchdog stays armed until the FEEDER finishes (it monitors the feeder), NOT until the
+      # loader returns. libvips images are lazy — pixels may be pulled from the source after
+      # new_from_enum/2 returns — so a watchdog tied to the load call would leave lazy evaluation
+      # unprotected. Tying it to the feeder's lifetime covers the whole danger window: once the
+      # feeder finalizes (buffer complete) no read can stall, and the watchdog self-terminates.
+      if timeout, do: start_spool_watchdog(spool, writer, timeout)
 
       try do
         with {:ok, source} <- Vix.SourceSpool.source(spool),
@@ -793,8 +819,6 @@ defmodule Vix.Vips.Image do
         kind, reason ->
           Vix.SourceSpool.abort(spool)
           :erlang.raise(kind, reason, __STACKTRACE__)
-      after
-        if watchdog, do: send(watchdog, :done)
       end
     end
   end
@@ -816,10 +840,16 @@ defmodule Vix.Vips.Image do
 
   # The watchdog both aborts the spool (wakes parked readers) AND kills the feeder.
   # Abort alone wakes readers but leaves a live-but-stalled producer blocked in the enum.
+  # Bounds the total time the producer (feeder) has to deliver `content_length` bytes. Monitoring
+  # the feeder means the timer covers the full producer lifetime — including any lazy pixel reads
+  # after new_from_enum/2 returns — and self-terminates the instant the feeder finishes.
   defp start_spool_watchdog(spool, writer, timeout) do
     spawn(fn ->
+      ref = Process.monitor(writer)
+
       receive do
-        :done -> :ok
+        # Feeder finalized/aborted and exited — the buffer is settled, no read can stall.
+        {:DOWN, ^ref, :process, ^writer, _reason} -> :ok
       after
         timeout ->
           Vix.SourceSpool.abort(spool)
