@@ -31,13 +31,17 @@ decoded by libvips with full seek support while chunks are still arriving.
 ### Concept: spooling
 
 A spool writes data to an intermediate buffer while a consumer reads from it concurrently —
-the print-spool etymology. Here: Elixir writes chunks to a growing temp file; libvips decodes
-from the same file via a `VipsSourceCustom` read handler that blocks at the write frontier
-instead of returning EOF.
+the print-spool etymology. Here: Elixir writes chunks to a growing in-memory buffer; libvips
+decodes from the same buffer via a `VipsSourceCustom` read handler that blocks at the write
+frontier instead of returning EOF. The backing store is RAM, not disk.
 
-All libvips-facing logic is pure C ↔ C (no BEAM re-entry). The objection to the `vips-connection`
-approach was specifically that libvips calls back into the BEAM from its decode threads; this
-design avoids that entirely.
+All libvips-facing logic is pure C ↔ C (no BEAM re-entry). The `vips-connection` branch
+required libvips to **pull** data from Elixir — the C read callback called into the BEAM to
+request the next chunk, which means a non-BEAM thread driving an Elixir process. This design
+reverses the direction: Elixir **pushes** chunks into a C buffer via the NIF write function.
+The C read callback reads from a buffer that BEAM has already filled; it never calls Elixir,
+never sends a message, never touches a BEAM process. The mutex/condvar is C ↔ C only —
+`enif_mutex`/`enif_cond` work on any thread, not just BEAM threads.
 
 ### New files
 
@@ -52,72 +56,78 @@ Changes to existing files: `c_src/vix.c` (NIF registration), `lib/vix/nif.ex` (N
 
 ### C module (`c_src/spool.c`)
 
-**Two structs, separate lifetimes:**
+**One struct, two owners:**
 
-`SpoolResource` — the BEAM-owned NIF resource (`SPOOL_RT`):
-- `int write_fd` — write end of the temp data file
-- `int ctrl_write_fd` — write end of the control pipe (signal "more data")
-- `char tmp_path[PATH_MAX]` — for `unlink` in the destructor
+```c
+typedef struct {
+    uint8_t  *data;
+    size_t    size;      // bytes written so far
+    size_t    capacity;  // allocated capacity
+    gint64    read_pos;  // current read position
+    int       done;      // writer has finalized
+    ErlNifMutex *lock;
+    ErlNifCond  *cond;
+} SpoolBuf;
+```
 
-`SpoolCallbackData` — heap-allocated, owned by the `VipsSourceCustom` GObject:
-- `int read_fd` — read end of the temp data file (independent file position from `write_fd`)
-- `int ctrl_read_fd` — read end of the control pipe (`poll()`-ed by the read callback)
-- Freed via `GDestroyNotify` when libvips unrefs the `VipsSourceCustom`
+The struct is allocated in `nif_source_spool_new`. Two things hold a reference to it:
 
-Separating these structs decouples BEAM resource lifetime (controlled by Elixir/GC) from
-callback data lifetime (controlled by libvips refcounting). Neither holds a raw pointer to
-the other.
+1. **The BEAM resource** (`SPOOL_RT`) — the write handle Elixir holds. Its destructor signals
+   `done` (in case `finalize` was never called) but does **not** free the struct.
+2. **The `VipsSourceCustom` GObject** — via `g_signal_connect_data` with a `GClosureNotify`
+   that frees the struct when libvips unrefs the source.
+
+This decouples BEAM resource lifetime (controlled by Elixir/GC) from buffer lifetime
+(controlled by libvips refcounting). The buffer lives until libvips is finished with it.
 
 **Three NIFs:**
 
 `nif_source_spool_new()`:
-- `mkstemp(tmp_path)` — creates temp file atomically, returns `write_fd`
-- `open(tmp_path, O_RDONLY)` — `read_fd` for callbacks
-- `pipe(ctrl_fds)` — `ctrl_write_fd` (O_CLOEXEC, O_NONBLOCK) and `ctrl_read_fd`
+- `enif_alloc` + `enif_mutex_create` + `enif_cond_create`
+- Initial buffer capacity (e.g. 64 KB), grows on demand
 - `vips_source_custom_new()`
-- `g_signal_connect_data` for `"read"` and `"seek"` signals, with `SpoolCallbackData` as
-  user_data and a `GClosureNotify` to close fds and free the struct when the source is finalized
+- `g_signal_connect_data` for `"read"` and `"seek"` signals, with `SpoolBuf*` as user_data
+  and a `GClosureNotify` to free the struct and its sync primitives
 - Returns `{spool_resource, source_term}` (source wrapped via existing `g_object_to_erl_term`)
 
 `nif_source_spool_write(resource, binary)` — marked `ERL_NIF_DIRTY_JOB_IO_BOUND`:
-- EINTR-safe write loop: `write(write_fd, data, len)` until all bytes written
-- Write one byte to `ctrl_write_fd` to signal the read callback
+- Lock, grow buffer if needed (`realloc`-style doubling), `memcpy`, `enif_cond_broadcast`, unlock
 
 `nif_source_spool_finalize(resource)`:
-- Closes `ctrl_write_fd` — C sees `POLLHUP`, interprets as end-of-stream
-- Closes `write_fd`
-- Idempotent: repeated calls are no-ops (fds set to -1 after close)
+- Lock, set `done = 1`, `enif_cond_broadcast`, unlock
+- Idempotent: repeated calls are no-ops
 
 **Resource destructor:**
-- Closes `ctrl_write_fd` and `write_fd` if not already closed (handles process-killed
-  cancellation where `finalize` was never called)
-- `unlink(tmp_path)` — temp file removed regardless of how the spool ended
-- `VipsSourceCustom` unref goes through the existing Janitor path (same as all GObjects in Vix)
+- Calls finalize logic if not already done (handles process-killed cancellation)
+- Does not free `SpoolBuf` — owned by `GClosureNotify`
 
 **Read callback** (registered on `"read"` signal):
 
 ```
-n = read(read_fd, buf, len)
-if n > 0: return n
-if n < 0: return -1  // real error
-// n == 0: at write frontier
-poll(ctrl_read_fd, POLLIN | POLLHUP, -1)
-  POLLIN:  drain one byte, retry read
-  POLLHUP: one final read(), return result (0 = true EOF, >0 = remaining bytes)
+lock
+while read_pos >= size && !done:
+    enif_cond_wait(cond, lock)
+n = min(len, size - read_pos)
+memcpy(buf, data + read_pos, n)
+read_pos += n
+unlock
+return n  // 0 only when done && read_pos == size (true EOF)
 ```
-
-`poll` with no timeout is safe: `ctrl_write_fd` always has a defined close path (explicit
-`finalize` or resource destructor).
 
 **Seek callback** (registered on `"seek"` signal):
 
-```c
-return lseek(read_fd, offset, whence);
+```
+lock
+new_pos = (SEEK_SET: offset) | (SEEK_CUR: read_pos + offset) | (SEEK_END: size + offset)
+read_pos = new_pos
+unlock
+return new_pos
 ```
 
-Five lines. `lseek` on a regular file always succeeds regardless of the write frontier;
-if the new position is ahead of what has been written, the subsequent `read()` call handles
-the wait via the poll loop above.
+`SEEK_END` before writing is complete returns the current (incomplete) `size`. This is the
+same behaviour as a growing file: the subsequent `read()` waits at the frontier via the
+condvar loop above. In practice, libvips uses `SEEK_SET` to known offsets when parsing
+container formats (HEIF/AVIF); `SEEK_END` before `done` is rare.
 
 Registering both `"read"` and `"seek"` signals causes libvips to open the source with
 `VIPS_ACCESS_RANDOM` (fully seekable). Without `"seek"`, it falls back to
@@ -138,17 +148,15 @@ defmodule Vix.SourceSpool do
 end
 ```
 
-No GenServer. File writes go through a NIF (not Elixir's `File` module) so that
-write + signal is one call, error propagation is unified, and the temp file lifecycle
-is entirely owned by C.
+No GenServer. The write path is a single NIF call (copy + signal), not two operations, so
+error propagation and buffer lifecycle are unified in C.
 
 ### Image API (`lib/vix/vips/image.ex`)
 
-`new_from_enum/2` gains a `seekable: true` option. When set, it routes to the spool
-path instead of the pipe path. The two paths are otherwise identical in API contract.
+`new_from_enum/2` gains a `seekable: true` option. When set, it routes to the spool path
+instead of the pipe path. Both paths are identical in API contract.
 
-The spool path follows the same `spawn_link` + `send/receive` pattern as the existing
-pipe path:
+The spool path follows the same `spawn_link` + `send/receive` pattern as the existing pipe path:
 
 ```elixir
 def new_from_enum(enum, opts \\ []) do
@@ -185,34 +193,39 @@ end
 ```
 
 `spawn_link` ensures that a crash in either the writer or the decoder kills the other.
-`try/after` ensures `finalize` is called — and `ctrl_write_fd` is closed — even when the
-stream raises. Since `finalize` is idempotent, the resource destructor running afterward
-is harmless.
+`try/after` ensures `finalize` is always called — setting `done = 1` and waking the read
+callback — even when the stream raises. Since `finalize` is idempotent, the resource
+destructor running afterward is harmless.
 
 ## Error handling and cancellation
 
 | Failure | What happens |
 |---|---|
-| Stream error mid-way | `try/after` calls `finalize` → `ctrl_write_fd` closes → C sees `POLLHUP` → libvips gets incomplete file → decode error returned |
-| Decode error | `spawn_link` kills writer child → resource destructor closes fds, unlinks temp file |
-| Process killed | Resource destructor fires (eventually) → same cleanup path as decode error |
+| Stream error mid-way | `try/after` calls `finalize` → `done = 1`, condvar broadcast → read callback wakes, drains remaining data, returns 0 (EOF) → libvips gets incomplete input → decode error returned |
+| Decode error | `spawn_link` kills writer child → resource destructor signals `done` → buffer freed by `GClosureNotify` when libvips unrefs source |
+| Process killed | Resource destructor fires (eventually) → same path as decode error |
 
 ## Testing
 
 - JPEG/PNG via `seekable: true` — baseline, behaviour identical to pipe path
 - HEIF/AVIF — seek-heavy formats decode correctly end-to-end
-- Stream error mid-way — `{:error, _}` returned, no temp files left behind
-- Process killed during decode — no leaked temp files after GC
+- Stream error mid-way — `{:error, _}` returned, no memory leaked
+- Process killed during decode — buffer freed after libvips unrefs source
 - `finalize/1` called twice — no crash, no error
-- Explicit `finalize/1` followed by resource destructor — no double-close crash
+- Explicit `finalize/1` followed by resource destructor — no double-signal crash
 
 ## Trade-offs and limitations
 
-- `seekable: false` (default) continues to use the pipe path — no temp file overhead for
-  callers that don't need it and are not loading HEIF/AVIF.
-- The temp file is always written to the OS default temp directory (`mkstemp` uses `$TMPDIR`
-  or `/tmp`). On systems where `/tmp` is `tmpfs`, the "disk write" never hits physical storage.
-  On systems with a slow `/tmp`, large images may see I/O overhead.
-- The concurrent download-and-decode benefit is only measurable when chunk delivery latency
-  is a significant fraction of total decode time. For fast origins, Tier 1 (user-space temp
-  file + `new_from_file`) captures equivalent value at zero Vix cost.
+- `seekable: false` (default) continues to use the pipe path — no buffer allocation overhead
+  for callers that don't need seekability.
+- The entire image occupies RAM for the duration of the decode. This is equivalent to
+  `new_from_buffer/2` in memory terms. The file-backed alternative (temp file + control pipe)
+  would allow the OS to page out cold data, but in practice libvips may seek to any position
+  at any time, so pages stay hot regardless. For bounded-size inputs the difference is
+  negligible.
+- Buffer growth uses doubling (`realloc`-style). Peak allocation is up to 2× the image size
+  before the final `realloc` settles. Callers with a known `max_body_bytes` bound can pre-size
+  the buffer to avoid any reallocation (a future option, not required now).
+- The concurrent decode benefit is only measurable when chunk delivery latency is a significant
+  fraction of total decode time. For fast origins, Tier 1 (user-space temp file + `new_from_file`)
+  captures equivalent value at zero Vix cost.
