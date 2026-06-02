@@ -299,6 +299,57 @@ end
 The convenience wrapper mints one source. Services wanting reopen-while-downloading call the
 `SourceSpool` API directly: `new` → spawn a feeder → `source/1` per decode → `abort` when done.
 
+## Concurrency model (invariants)
+
+These hold the design at "moderate, not gnarly." Treat them as binding during implementation;
+each is a place where a small deviation becomes a use-after-free or a permanently parked
+dirty-scheduler thread.
+
+1. **One lock guards all mutable state.** `data`, `size`, `capacity`, `state`, `err_errno`, and
+   every reader's `read_pos` are touched only while holding `buf->lock`. The immutable-after-`new`
+   fields (`content_length`, `max_bytes`) may be read without it. `refcnt` is atomic and moved
+   without the lock. There is exactly one lock, so there is no lock-ordering or nesting concern —
+   and no code path may acquire `buf->lock` while already holding it (no spool function called
+   under the lock re-takes it).
+
+2. **Reads copy under the lock.** The read callback's `memcpy` from `buf->data` runs while the
+   lock is held, because a concurrent `write` may `realloc` and move `data`. A pointer into
+   `buf->data` must never escape the lock. *Do not* move the copy outside the lock to cut
+   contention — that is an immediate use-after-free. (If contention ever matters, switch to the
+   segmented buffer in "Memory and scheduler notes"; do not weaken this invariant.)
+
+3. **Condvar waits are always `while`-loops, woken by broadcast.** Readers re-check
+   `read_pos >= size && state == OPEN` after every wake, never an `if`. `enif_cond_broadcast`
+   (not signal) is used so all cursors re-evaluate — required for multiple readers. `enif_cond_wait`
+   is the only place the lock is released while "blocked"; no other code holds the lock across a
+   blocking call (the `memcpy`/`realloc` in `write` are bounded CPU work, not blocking).
+
+4. **All state transitions go through one chokepoint.** A single
+   `spool_set_terminal_locked(buf, new_state, errno)` performs
+   `if (state == OPEN) { state = new_state; err_errno = errno; } enif_cond_broadcast(cond)` and
+   nothing mutates `state` anywhere else. Callers already holding the lock (the `write` overflow
+   path) call it directly; callers that don't (`finalize`, `abort`, the monitor-down callback, the
+   handle-dtor backstop) use a thin `spool_set_terminal` wrapper that locks around it — this is the
+   reentrancy guard for invariant 1. `finalize` computes `size == content_length ? DONE : ABORTED`
+   and passes it. `OPEN` is the only non-terminal state; `DONE`/`ABORTED` are sinks — so
+   idempotency and first-transition-wins both fall out, and the five trigger paths collapse to five
+   callers of one 6-line function.
+
+5. **Callbacks use native primitives only.** `read_cb`/`seek_cb` run on libvips decode threads,
+   not BEAM threads. They touch only `enif_mutex_*`/`enif_cond_*`, `memcpy`, and immutable fields —
+   never an `ErlNifEnv`, a term API, or anything requiring a BEAM scheduler. This is what makes the
+   C↔C boundary safe.
+
+6. **Refcount is balanced.** `spool_ref` on each new holder (write handle; each `SpoolReader`),
+   `spool_unref` on each release (handle dtor; `spool_reader_free`). The `data`, mutex, condvar, and
+   struct are freed exactly once, by the `spool_unref` that drops `refcnt` to 0. Every `ref` has
+   exactly one matching `unref`.
+
+7. **Every park has a guaranteed wake.** A reader parked at the frontier is always woken by some
+   `spool_set_terminal` caller — including the monitor-down callback, which fires even when the
+   writer dies untrappably (kill / link-propagated exit). This is the liveness guarantee; without
+   it a parked reader would hold a dirty-IO scheduler thread forever.
+
 ## Lifetimes
 
 - **Writer:** linked to the caller; fills the buffer to `content_length`, finalizes, exits. Its
