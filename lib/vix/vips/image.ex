@@ -803,6 +803,7 @@ defmodule Vix.Vips.Image do
       # unprotected. Tying it to the feeder's lifetime covers the whole danger window: once the
       # feeder finalizes (buffer complete) no read can stall, and the watchdog self-terminates.
       if timeout, do: start_spool_watchdog(spool, writer, timeout)
+      mon = Process.monitor(writer)
 
       try do
         with {:ok, source} <- Vix.SourceSpool.source(spool),
@@ -813,13 +814,31 @@ defmodule Vix.Vips.Image do
         else
           {:error, _} = err ->
             Vix.SourceSpool.abort(spool)
-            err
+            # If the producer raised, surface its reason instead of the generic decode error.
+            spool_producer_error(mon, writer) || err
         end
       catch
         kind, reason ->
           Vix.SourceSpool.abort(spool)
           :erlang.raise(kind, reason, __STACKTRACE__)
+      after
+        Process.demonitor(mon, [:flush])
       end
+    end
+  end
+
+  # The feeder exits with {:shutdown, {:producer_error, reason}} if the enumerable raised. On a
+  # decode failure, check for that exit so the caller sees the real producer reason rather than the
+  # downstream libvips error. Other exits (:normal, :killed by the watchdog) fall back to `err`.
+  defp spool_producer_error(mon, writer) do
+    receive do
+      {:DOWN, ^mon, :process, ^writer, {:shutdown, {:producer_error, reason}}} ->
+        {:error, {:producer_error, reason}}
+
+      {:DOWN, ^mon, :process, ^writer, _other} ->
+        nil
+    after
+      200 -> nil
     end
   end
 

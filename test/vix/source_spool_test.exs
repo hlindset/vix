@@ -372,4 +372,49 @@ defmodule Vix.SourceSpoolTest do
 
     assert Enum.all?(Task.await_many(tasks, 12_000), &(&1 == expected))
   end
+
+  # ---- status/1 ----
+
+  test "status/1 reports the terminal state and abort cause" do
+    {:ok, open} = SourceSpool.new(content_length: 10)
+    assert :open == SourceSpool.status(open)
+    :ok = SourceSpool.write(open, "abc")
+    assert :open == SourceSpool.status(open)
+
+    {:ok, done} = SourceSpool.new(content_length: 5)
+    :ok = SourceSpool.write(done, "abcde")
+    :ok = SourceSpool.finalize(done)
+    assert :done == SourceSpool.status(done)
+
+    {:ok, overflow} = SourceSpool.new(content_length: 5)
+    :ok = SourceSpool.write(overflow, "abc")
+    assert {:error, :overflow} = SourceSpool.write(overflow, "defgh")
+    assert {:aborted, :overflow} == SourceSpool.status(overflow)
+
+    {:ok, short} = SourceSpool.new(content_length: 10)
+    :ok = SourceSpool.write(short, "abc")
+    assert {:error, :short} = SourceSpool.finalize(short)
+    assert {:aborted, :short} == SourceSpool.status(short)
+
+    {:ok, cancelled} = SourceSpool.new(content_length: 10)
+    :ok = SourceSpool.abort(cancelled)
+    assert {:aborted, :cancelled} == SourceSpool.status(cancelled)
+  end
+
+  @tag timeout: 10_000
+  test "status/1 reports {:aborted, :writer_down} when the writer dies" do
+    parent = self()
+
+    writer =
+      spawn(fn ->
+        {:ok, spool} = SourceSpool.new(content_length: 10)
+        send(parent, {:spool, spool})
+        Process.sleep(:infinity)
+      end)
+
+    spool = receive do: ({:spool, s} -> s), after: (1_000 -> flunk("no spool"))
+    Process.exit(writer, :kill)
+    Process.sleep(50)
+    assert {:aborted, :writer_down} == SourceSpool.status(spool)
+  end
 end

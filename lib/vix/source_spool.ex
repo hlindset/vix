@@ -48,6 +48,24 @@ defmodule Vix.SourceSpool do
     end
   end
 
+  @typedoc """
+  The spool's terminal state. `{:aborted, reason}` distinguishes the cause:
+
+    * `:overflow` - a write exceeded `content_length`
+    * `:short` - finalized before reaching `content_length`
+    * `:cancelled` - explicit `abort/1` (incl. the feeder aborting on a producer error)
+    * `:writer_down` - the writer process died before finalizing
+  """
+  @type status :: :open | :done | {:aborted, :overflow | :short | :cancelled | :writer_down | :error}
+
+  @doc """
+  Returns the spool's current state — `:open`, `:done`, or `{:aborted, reason}`.
+
+  Callable from any process; useful for diagnosing why a decode over the spool failed.
+  """
+  @spec status(t) :: status
+  def status(%SourceSpool{ref: ref}), do: Nif.nif_source_spool_status(ref)
+
   @spec start_feeder(Enumerable.t(), keyword) :: {:ok, t, pid} | {:error, term}
   def start_feeder(enum, opts) do
     case Keyword.fetch(opts, :content_length) do
@@ -116,9 +134,15 @@ defmodule Vix.SourceSpool do
         n when is_integer(n) -> finalize(spool)  # enum ended early -> {:error, :short}
       end
     rescue
-      _ -> abort(spool)
+      e ->
+        # Abort wakes any parked reader (decode fails); exit carries the producer's reason so a
+        # consumer monitoring the feeder can surface it. {:shutdown, _} avoids a crash report.
+        abort(spool)
+        exit({:shutdown, {:producer_error, {e, __STACKTRACE__}}})
     catch
-      _, _ -> abort(spool)
+      kind, reason ->
+        abort(spool)
+        exit({:shutdown, {:producer_error, {kind, reason}}})
     end
   end
 

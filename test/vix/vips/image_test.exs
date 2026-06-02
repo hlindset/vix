@@ -602,6 +602,29 @@ defmodule Vix.Vips.ImageTest do
                Image.new_from_enum(enum, seekable: true, content_length: total, timeout: 300)
     end
 
+    # When the producer (enumerable) raises, the decode fails with the producer's reason wrapped in
+    # {:producer_error, _}, not the downstream libvips read error — so callers can diagnose the
+    # real cause. A seek-heavy TIFF guarantees the decode actually needs the withheld bytes.
+    @tag timeout: 10_000
+    test "seekable surfaces the producer's exception as the error reason" do
+      bytes = File.read!(img_path("boats.tif"))
+      total = byte_size(bytes)
+      half = binary_part(bytes, 0, div(total, 2))
+
+      enum =
+        Stream.resource(
+          fn -> :half end,
+          fn
+            :half -> {[half], :boom}
+            :boom -> raise "upstream exploded"
+          end,
+          fn _ -> :ok end
+        )
+
+      assert {:error, {:producer_error, {%RuntimeError{message: "upstream exploded"}, _stack}}} =
+               Image.new_from_enum(enum, seekable: true, content_length: total)
+    end
+
     for name <- ["sample.heic", "sample.avif"] do
       @tag :heif
       @tag timeout: 10_000

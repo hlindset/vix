@@ -291,6 +291,9 @@ defmodule Vix.Nif do
   def nif_source_spool_source(_spool),
     do: :erlang.nif_error(:nif_library_not_loaded)
 
+  def nif_source_spool_status(_spool),
+    do: :erlang.nif_error(:nif_library_not_loaded)
+
   @spec load_config :: map
   defp load_config do
     %{nif_logger_level: nif_logger_level()}

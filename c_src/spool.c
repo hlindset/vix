@@ -26,6 +26,18 @@ static ErlNifResourceType *SPOOL_WRITE_RT;
 
 typedef enum { SPOOL_OPEN, SPOOL_DONE, SPOOL_ABORTED } SpoolState;
 
+/* API-facing abort cause reported by status/1. Kept separate from err_errno because errno values
+   collapse on some platforms (ENODATA/ECANCELED are #defined to EIO on macOS), so errno can't
+   distinguish the causes. */
+typedef enum {
+  SPOOL_REASON_NONE,
+  SPOOL_REASON_OVERFLOW,
+  SPOOL_REASON_SHORT,
+  SPOOL_REASON_CANCELLED,
+  SPOOL_REASON_WRITER_DOWN,
+  SPOOL_REASON_ERROR
+} SpoolReason;
+
 typedef struct {
   ErlNifMutex *lock;
   ErlNifCond *cond;
@@ -35,7 +47,8 @@ typedef struct {
   gint64 content_length; /* immutable after new */
 
   SpoolState state;
-  int err_errno;
+  SpoolReason reason;    /* API cause when state == SPOOL_ABORTED */
+  int err_errno;         /* libvips-facing errno surfaced by read_cb */
 } SpoolBuf;
 
 typedef struct {
@@ -58,18 +71,20 @@ static int is_writer(ErlNifEnv *env, SpoolWriteHandle *wr);
 /* ---- terminal-state chokepoint (invariant 4) ---- */
 
 /* caller holds buf->lock */
-static void spool_set_terminal_locked(SpoolBuf *b, SpoolState st, int err) {
+static void spool_set_terminal_locked(SpoolBuf *b, SpoolState st, SpoolReason reason,
+                                      int err) {
   if (b->state == SPOOL_OPEN) {
     b->state = st;
+    b->reason = reason;
     if (st == SPOOL_ABORTED)
       b->err_errno = err ? err : EIO;
   }
   enif_cond_broadcast(b->cond);
 }
 
-static void spool_set_terminal(SpoolBuf *b, SpoolState st, int err) {
+static void spool_set_terminal(SpoolBuf *b, SpoolState st, SpoolReason reason, int err) {
   enif_mutex_lock(b->lock);
-  spool_set_terminal_locked(b, st, err);
+  spool_set_terminal_locked(b, st, reason, err);
   enif_mutex_unlock(b->lock);
 }
 
@@ -93,7 +108,7 @@ static void spool_write_dtor(ErlNifEnv *env, void *obj) {
        auto-removed monitor faults inside the dtor on OTP 27+ (observed:
        ethr_mutex_lock EINVAL on the very next lock). pipe.c's dtor likewise
        never demonitors. */
-    spool_set_terminal(wr->buf, SPOOL_ABORTED, EPIPE); /* backstop if still OPEN */
+    spool_set_terminal(wr->buf, SPOOL_ABORTED, SPOOL_REASON_WRITER_DOWN, EPIPE); /* backstop if still OPEN */
     enif_release_resource(wr->buf);                    /* outside any lock */
     wr->buf = NULL;
   }
@@ -104,7 +119,7 @@ static void spool_write_down(ErlNifEnv *env, void *obj, ErlNifPid *pid,
                              ErlNifMonitor *monitor) {
   SpoolWriteHandle *wr = (SpoolWriteHandle *)obj;
   if (wr->buf)
-    spool_set_terminal(wr->buf, SPOOL_ABORTED, EPIPE);
+    spool_set_terminal(wr->buf, SPOOL_ABORTED, SPOOL_REASON_WRITER_DOWN, EPIPE);
 }
 
 int nif_source_spool_init(ErlNifEnv *env) {
@@ -158,6 +173,7 @@ ERL_NIF_TERM nif_source_spool_new(ErlNifEnv *env, int argc,
   buf->size = 0;
   buf->content_length = content_length;
   buf->state = SPOOL_OPEN;
+  buf->reason = SPOOL_REASON_NONE;
   buf->err_errno = 0;
 
   buf->data = enif_alloc(content_length > 0 ? (size_t)content_length : 1);
@@ -226,7 +242,7 @@ ERL_NIF_TERM nif_source_spool_write(ErlNifEnv *env, int argc,
 
     /* would this binary exceed the declared length? (size <= content_length) */
     if ((gint64)(bin.size - off) > b->content_length - b->size) {
-      spool_set_terminal_locked(b, SPOOL_ABORTED, EFBIG);
+      spool_set_terminal_locked(b, SPOOL_ABORTED, SPOOL_REASON_OVERFLOW, EFBIG);
       enif_mutex_unlock(b->lock);
       return make_error_term(env, make_atom(env, "overflow"));
     }
@@ -270,10 +286,10 @@ ERL_NIF_TERM nif_source_spool_finalize(ErlNifEnv *env, int argc,
   enif_mutex_lock(b->lock);
   if (b->state == SPOOL_OPEN) {
     if (b->size == b->content_length) {
-      spool_set_terminal_locked(b, SPOOL_DONE, 0);
+      spool_set_terminal_locked(b, SPOOL_DONE, SPOOL_REASON_NONE, 0);
       ret = ATOM_OK;
     } else {
-      spool_set_terminal_locked(b, SPOOL_ABORTED, ENODATA);
+      spool_set_terminal_locked(b, SPOOL_ABORTED, SPOOL_REASON_SHORT, ENODATA);
       ret = make_error_term(env, make_atom(env, "short"));
     }
   } else if (b->state == SPOOL_DONE) {
@@ -294,8 +310,52 @@ ERL_NIF_TERM nif_source_spool_abort(ErlNifEnv *env, int argc,
   if (!enif_get_resource(env, argv[0], SPOOL_WRITE_RT, (void **)&wr))
     return make_error(env, "invalid spool handle");
   if (wr->buf) /* NULL only after the dtor ran; defensive */
-    spool_set_terminal(wr->buf, SPOOL_ABORTED, ECANCELED);
+    spool_set_terminal(wr->buf, SPOOL_ABORTED, SPOOL_REASON_CANCELLED, ECANCELED);
   return ATOM_OK;
+}
+
+/* ---- status (any process) ---- */
+
+static ERL_NIF_TERM reason_atom(ErlNifEnv *env, SpoolReason reason) {
+  switch (reason) {
+  case SPOOL_REASON_OVERFLOW:
+    return make_atom(env, "overflow");
+  case SPOOL_REASON_SHORT:
+    return make_atom(env, "short");
+  case SPOOL_REASON_CANCELLED:
+    return make_atom(env, "cancelled");
+  case SPOOL_REASON_WRITER_DOWN:
+    return make_atom(env, "writer_down");
+  default:
+    return make_atom(env, "error");
+  }
+}
+
+ERL_NIF_TERM nif_source_spool_status(ErlNifEnv *env, int argc,
+                                     const ERL_NIF_TERM argv[]) {
+  ASSERT_ARGC(argc, 1);
+  SpoolWriteHandle *wr;
+  if (!enif_get_resource(env, argv[0], SPOOL_WRITE_RT, (void **)&wr))
+    return make_error(env, "invalid spool handle");
+
+  SpoolBuf *b = wr->buf;
+  if (!b) /* dtor already ran */
+    return enif_make_tuple2(env, make_atom(env, "aborted"),
+                            make_atom(env, "writer_down"));
+
+  enif_mutex_lock(b->lock);
+  SpoolState st = b->state;
+  SpoolReason rs = b->reason;
+  enif_mutex_unlock(b->lock);
+
+  switch (st) {
+  case SPOOL_DONE:
+    return make_atom(env, "done");
+  case SPOOL_ABORTED:
+    return enif_make_tuple2(env, make_atom(env, "aborted"), reason_atom(env, rs));
+  default:
+    return make_atom(env, "open");
+  }
 }
 
 /* ---- source/1 + read/seek callbacks ---- */
