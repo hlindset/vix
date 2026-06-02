@@ -199,4 +199,26 @@ defmodule Vix.SourceSpoolTest do
     assert :ok = SourceSpool.finalize(spool)
     assert :ok = SourceSpool.abort(spool)
   end
+
+  test "image retains its source: buffer survives GC of BOTH the spool handle and the source term" do
+    bytes = File.read!(img_path("puppies.jpg"))
+
+    # Create the spool handle AND the source inside the closure, so after it returns the ONLY
+    # path keeping the buffer alive is the image retaining the source. If the load op did not
+    # retain it, the buffer would be freed and the eval below would use-after-free.
+    img =
+      (fn ->
+         {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+         :ok = SourceSpool.write(spool, bytes)
+         :ok = SourceSpool.finalize(spool)
+         {:ok, source} = SourceSpool.source(spool)
+         {:ok, img} = decode_source(source)
+         img
+       end).()
+
+    :erlang.garbage_collect()
+    # Definitive UAF detection is the valgrind/ASan run in Step 3 (GC + Janitor unref is async,
+    # so a clean pass here is necessary-but-not-sufficient).
+    assert {:ok, _bin} = Image.write_to_buffer(img, ".png")
+  end
 end
