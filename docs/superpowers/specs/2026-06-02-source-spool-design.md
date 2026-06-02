@@ -1,7 +1,8 @@
 # SourceSpool design
 
 **Date:** 2026-06-02
-**Status:** Draft (revised after second review round)
+**Status:** Draft (architecture converged after four review rounds; remaining items are
+implementation rigor, captured in the Implementation checklist)
 
 ## Problem
 
@@ -89,9 +90,7 @@ One shared, refcounted, **pre-allocated** buffer; many lightweight reader cursor
 ```c
 typedef enum { SPOOL_OPEN, SPOOL_DONE, SPOOL_ABORTED } SpoolState;
 
-typedef struct {
-    gatomicrefcount refcnt;   // GLib refcount (GLib is already a libvips dep)
-
+typedef struct {              // a SPOOL_BUF_RT NIF resource — the VM owns its refcount
     ErlNifMutex *lock;
     ErlNifCond  *cond;        // broadcast on: bytes published, state change
 
@@ -103,7 +102,7 @@ typedef struct {
     int        err_errno;     // set when state == SPOOL_ABORTED
 } SpoolBuf;
 
-typedef struct {              // one per VipsSourceCustom; owns one SpoolBuf ref
+typedef struct {              // one per VipsSourceCustom; keeps one SPOOL_BUF_RT ref
     SpoolBuf *buf;
     gint64    read_pos;       // this reader's cursor
 } SpoolReader;
@@ -116,11 +115,18 @@ failure (allocation can only fail at `new`, which fails cleanly), there is no 2�
 the write path never copies the whole buffer under the lock. Lazy page-commit means declaring N
 bytes does not touch N bytes of RAM until they are written.
 
-`SpoolBuf` is refcounted, not owned by either world directly. References:
-- the **write handle** BEAM resource (`SPOOL_WRITE_RT`) held by the writer process — 1 ref;
-- each `VipsSourceCustom` via its `SpoolReader` — 1 ref apiece.
+`SpoolBuf` is itself a NIF resource (`SPOOL_BUF_RT`); its refcount is the BEAM's, taken with
+`enif_keep_resource` and dropped with `enif_release_resource` — no GLib/C11 atomics, and no
+portability question. Holders:
+- the **write handle** (`SPOOL_WRITE_RT`) — the creation ref;
+- each `VipsSourceCustom` via its `SpoolReader` — one `keep` apiece.
 
-The buffer, `data`, mutex, and condvar are freed only when the last ref drops (`spool_unref` → 0).
+The resource destructor frees `data`, mutex, and condvar when the last ref drops (never call the
+releasing `enif_release_resource` while holding `buf->lock` — the destructor would destroy the lock
+under you). Making the buffer a resource also **pins the NIF library**: OTP postpones library unload
+while any `SPOOL_BUF_RT` exists, so the `read_cb`/`seek_cb`/`spool_reader_free` function pointers held
+by a live `VipsSourceCustom` can never dangle — even if the Elixir-side source term is GC'd while
+libvips still holds the GObject.
 
 ### The write handle and the monitored process
 
@@ -154,14 +160,15 @@ leaves readers parked forever. The public API encodes this so callers cannot get
 - if `enif_self != wr->writer` → `{:error, :not_owner}` (single-writer enforcement; no lock needed,
   `writer` is immutable)
 - `enif_inspect_binary`; let `n = bin.size`
-- lock; if `state != OPEN` → unlock, `{:error, :closed}`
-- if `n > content_length - size` → `spool_set_terminal_locked(ABORTED, EFBIG)`; unlock;
-  `{:error, :overflow}` (the C check is authoritative even though Elixir also guards)
-- copy into `data[size .. size+n)` in **bounded slices** of `SPOOL_MAX_SLICE` (e.g. 256 KB): per
-  slice, `memcpy`, advance `size`, `cond_broadcast`, and re-check `state` (so a concurrent `abort`
-  stops a large chunk promptly). Lock is held across the loop but released-and-bounded per slice
-  keeps the critical section small and lets regular control NIFs interleave.
-- unlock; `:ok`
+- copy in a **lock-per-slice** loop of `SPOOL_MAX_SLICE` (e.g. 256 KB) chunks. Per slice: **lock**;
+  if `state == DONE` → unlock, `{:error, :closed}`; if `state == ABORTED` → unlock, `{:error,
+  :aborted}`; if `remaining > content_length - size` → `spool_set_terminal_locked(ABORTED, EFBIG)`,
+  unlock, `{:error, :overflow}`; else `memcpy` one slice, advance `size`, `cond_broadcast`,
+  **unlock**; advance the input pointer. Releasing the lock *between* slices is what actually lets
+  `abort`/`finalize`/readers interleave — and it is safe precisely because only the single owner
+  process advances `size`, so no concurrent writer can race. A mid-write `abort` is observed at the
+  next slice and stops promptly.
+- `:ok` when all bytes are copied
 
 `nif_source_spool_finalize(handle)` — regular; idempotent; writer-only (`:not_owner` otherwise):
 - lock; on `OPEN` → `spool_set_terminal_locked(size == content_length ? DONE : ABORTED, ENODATA)`
@@ -172,12 +179,15 @@ leaves readers parked forever. The public API encodes this so callers cannot get
 - lock; `spool_set_terminal_locked(ABORTED, ECANCELED)`; unlock; `:ok`
 
 `nif_source_spool_source(handle)` — regular:
-- `reader = enif_alloc(...)`; on fail → `{:error, :enomem}`
-- `spool_ref(buf)`; `reader->buf = buf`; `reader->read_pos = 0`
-- `sc = vips_source_custom_new()`; on fail → `spool_unref(buf)`, free reader, `{:error, ...}`
+- **lock**; if `state == ABORTED` → unlock, `{:error, :aborted}` (the check is under the same lock
+  as the terminal transition; a `DONE` or `OPEN` spool proceeds — `OPEN` is the overlap path).
+  `reader = enif_alloc(...)`; `enif_keep_resource(buf)`; `reader->buf = buf`; `reader->read_pos = 0`;
+  unlock. (A concurrent `abort` *after* this check still leaves a valid source that fails on first
+  read — documented, not a bug.)
+- `sc = vips_source_custom_new()`; on fail → `enif_release_resource(buf)`, free reader, `{:error, ...}`
 - `g_object_set_data_full(G_OBJECT(sc), "vix-spool-reader", reader, spool_reader_free)` — the
-  **single** owning destroy notify (`spool_reader_free` = `spool_unref(buf)` then `enif_free(reader)`);
-  `reader` ownership is now the GObject's
+  **single** owning destroy notify (`spool_reader_free` = `enif_release_resource(buf)` then
+  `enif_free(reader)`); `reader` ownership is now the GObject's
 - `g_signal_connect(sc, "read", G_CALLBACK(spool_read_cb), reader)` and `..."seek", spool_seek_cb,
   reader` — **non-owning** (no per-signal `GClosureNotify`; this is what avoids the double-free)
 - `term = g_object_to_erl_term(env, sc)`; if that fails → `g_object_unref(sc)` (runs the destroy
@@ -185,7 +195,8 @@ leaves readers parked forever. The public API encodes this so callers cannot get
 - creating a source after `DONE` is valid (full buffer available); after `ABORTED`, return
   `{:error, :aborted}` rather than handing back a source that fails on first read
 
-**Write-handle destructor:** `spool_set_terminal` backstop if still `OPEN`, then `spool_unref(buf)`.
+**Write-handle destructor:** `spool_set_terminal` backstop if still `OPEN`, then
+`enif_release_resource(buf)` (outside the lock).
 **Monitor down callback (writer died):** `spool_set_terminal(ABORTED, EPIPE)` — the primary liveness
 mechanism. **GObject lifetime:** the `VipsSourceCustom` is exposed as a BEAM resource via
 `g_object_to_erl_term`, so OTP postpones NIF-library unload while any source exists — keeping the
@@ -223,6 +234,14 @@ static gint64 spool_read_cb(VipsSourceCustom *source, void *buffer,
 Returns `0` only at a clean `DONE` end; `-1` (with `errno`) on abort; never computes
 `size - read_pos` when `read_pos >= size`. `SPOOL_MAX_SLICE` bounds lock-hold even if libvips asks
 for a huge `length`.
+
+**Explicit invariant (guards against a future "optimization"):** a read at declared EOF — i.e.
+`read_pos == content_length` reached via `SEEK_END` before the writer finalizes — *blocks while
+`OPEN`* and returns `0` only after `DONE` (or `-1` after `ABORTED`). It must **never** return `0`
+just because `read_pos == content_length`; EOF is only knowable once the writer finalizes, and a
+premature `0` would let a loader conclude the stream is complete too early. Note also that `ABORTED`
+poisons the *whole* source: a reader at an already-published earlier offset still gets `-1`, by
+design (an incomplete declared object is invalid; fail fast).
 
 ### Seek callback
 
@@ -276,25 +295,35 @@ Now a documented public module (it is a real API surface given `source/1`), with
 
 ```elixir
 defmodule Vix.SourceSpool do
-  @opaque t :: %__MODULE__{ref: reference()}
+  @opaque t :: %__MODULE__{ref: term()}     # ref is a NIF resource term, NOT an Erlang reference()
   defstruct [:ref]
 
-  @spec new(keyword) :: {:ok, t} | {:error, term}          # content_length:, max_bytes:
-  @spec write(t, binary) :: :ok | {:error, :closed | :overflow | :not_owner}
-  @spec finalize(t) :: :ok | {:error, :short | :aborted | :not_owner}
-  @spec abort(t) :: :ok
-  @spec source(t) :: {:ok, Vix.Vips.Source.t()} | {:error, :aborted | term}
-
-  # Packages the monitor-safe handshake: spawns a linked feeder that calls new/1 (so the FEEDER
-  # is the monitored writer), feeds the enum, and finalizes at exactly content_length.
+  # PRIMARY constructor. Spawns a monitored feeder that calls new/1 internally (so the FEEDER is the
+  # monitored writer), feeds the enum, and finalizes at exactly content_length. Returns the spool
+  # handle for source/1 + abort/1, and the feeder pid for supervision/watchdogs.
   @spec start_feeder(Enumerable.t(), keyword) :: {:ok, t, pid} | {:error, term}
+
+  @spec source(t) :: {:ok, Vix.Vips.Source.t()} | {:error, :aborted | term}
+  @spec abort(t) :: :ok                     # callable by any process holding the handle
+
+  # LOW-LEVEL / ADVANCED. The process that calls new/1 becomes the *only* process permitted to
+  # write/2 and finalize/1, and is the process the native monitor watches — its death aborts the
+  # spool. Calling new/1 in the wrong process is the footgun start_feeder/2 exists to prevent;
+  # most callers should never touch these three.
+  @spec new(keyword) :: {:ok, t} | {:error, term}          # content_length:, max_bytes:
+  @spec write(t, binary) :: :ok | {:error, :closed | :aborted | :overflow | :not_owner}
+  @spec finalize(t) :: :ok | {:error, :short | :aborted | :not_owner}
 end
 ```
 
-`new/1` enforces `content_length <= max_bytes` (default `max_bytes = content_length`) before the
-NIF; `max_bytes` is the caller/operator policy cap, meaningful when `content_length` comes from an
-untrusted `Content-Length`. Services that want reopen-while-downloading use `start_feeder/2` then
-call `source/1` per decode — they never call `new/1` in the wrong process.
+`new/1` enforces `content_length <= max_bytes` before the NIF. **`max_bytes` defaults to a
+library-level policy cap, *not* `content_length`** —
+`Application.get_env(:vix, :source_spool_max_bytes, 104_857_600)` (100 MiB) — so an untrusted
+`Content-Length` cannot reserve an unbounded buffer; callers raise it explicitly when they trust the
+source. Writing the final byte does **not** imply `DONE`; the writer must call `finalize/1`
+(`start_feeder/2` does this automatically) — otherwise readers parked at EOF wait until writer death
+aborts the spool. Reopen-while-downloading keeps the spool handle alive and calls `source/1` per
+decode.
 
 ### Image API (`lib/vix/vips/image.ex`)
 
@@ -307,26 +336,26 @@ def new_from_enum(enum, opts \\ []) do
 end
 
 defp new_from_enum_spool(enum, opts) do
-  {len, opts} = Keyword.pop(opts, :content_length)
-  if is_nil(len) do
-    {:error, :content_length_required}
-  else
-    {max, opts} = Keyword.pop(opts, :max_bytes, len)
-    case SourceSpool.start_feeder(enum, content_length: len, max_bytes: max) do
-      {:error, _} = err -> err
-      {:ok, spool, writer} ->
-        try do
-          with :ok <- validate_options(opts),
-               {:ok, source} <- SourceSpool.source(spool),
-               {:ok, loader} <- Foreign.find_load_source(source),
-               {:ok, {ref, _}} <- Operation.Helper.operation_call(loader, [source], opts) do
-            {:ok, wrap_type(ref)}
-          else
-            {:error, _} = err -> SourceSpool.abort(spool); err   # stop the feeder draining RAM
-          end
-        catch
-          kind, reason -> SourceSpool.abort(spool); :erlang.raise(kind, reason, __STACKTRACE__)
-        end
+  {timeout, opts} = Keyword.pop(opts, :timeout)            # optional watchdog (ms)
+  {len, opts}     = Keyword.pop(opts, :content_length)
+  {max, opts}     = Keyword.pop(opts, :max_bytes, default_max_bytes())
+  with {:ok, len} <- validate_content_length(len, max),    # validate BEFORE spawning/allocating
+       :ok        <- validate_options(opts),
+       {:ok, spool, _writer} <-
+         SourceSpool.start_feeder(enum, content_length: len, max_bytes: max) do
+    watchdog = timeout && start_watchdog(spool, timeout)    # sends abort/1 on timeout
+    try do
+      with {:ok, source} <- SourceSpool.source(spool),
+           {:ok, loader} <- Foreign.find_load_source(source),
+           {:ok, {ref, _}} <- Operation.Helper.operation_call(loader, [source], opts) do
+        {:ok, wrap_type(ref)}
+      else
+        {:error, _} = err -> SourceSpool.abort(spool); err   # stop the feeder draining RAM
+      end
+    catch
+      kind, reason -> SourceSpool.abort(spool); :erlang.raise(kind, reason, __STACKTRACE__)
+    after
+      watchdog && send(watchdog, :done)
     end
   end
 end
@@ -336,13 +365,19 @@ end
 exhaustion — critical, because a stream that yields exactly `content_length` bytes then blocks would
 otherwise leave the reader parked at EOF forever:
 
+`start_feeder/2` uses `spawn_monitor`, **not** `spawn_link` (the earlier choice). The native monitor
+already guarantees C-side liveness, so the BEAM link bought nothing but a footgun: an abnormal feeder
+death could kill the caller after the dirty NIF returned. With `spawn_monitor`, feeder death always
+arrives as a `{:DOWN, ...}` *message* — never an exit signal — so a public image-load call returns
+`{:error, _}` instead of sometimes crashing its caller, regardless of `trap_exit`.
+
 ```elixir
 def start_feeder(enum, opts) do
   parent = self()
   len = Keyword.fetch!(opts, :content_length)
 
-  writer =
-    spawn_link(fn ->
+  {writer, mon} =
+    spawn_monitor(fn ->
       case new(opts) do
         {:ok, spool} -> send(parent, {self(), {:ok, spool}}); feed_spool(enum, spool, len)
         {:error, _} = err -> send(parent, {self(), err})
@@ -350,13 +385,17 @@ def start_feeder(enum, opts) do
     end)
 
   receive do
-    {^writer, {:ok, spool}}    -> {:ok, spool, writer}
-    {^writer, {:error, _} = e} -> e
-    {:EXIT, ^writer, reason}   -> {:error, reason}   # only delivered if caller traps exits
+    {^writer, {:ok, spool}}    -> Process.demonitor(mon, [:flush]); {:ok, spool, writer}
+    {^writer, {:error, _} = e} -> Process.demonitor(mon, [:flush]); e
+    {:DOWN, ^mon, :process, ^writer, reason} -> {:error, reason}   # no caller crash, no hang
   end
 end
 
-defp feed_spool(enum, spool, len) do
+# content_length == 0 must finalize WITHOUT pulling the enum (a non-terminating empty stream
+# would otherwise park the feeder before finalize, deadlocking readers at EOF).
+defp feed_spool(_enum, spool, 0), do: finalize(spool)
+
+defp feed_spool(enum, spool, len) when len > 0 do
   try do
     enum
     |> Enum.reduce_while(0, fn iodata, written ->
@@ -390,7 +429,7 @@ thread.
 
 1. **One lock guards all mutable state.** `size`, `state`, `err_errno`, and each reader's `read_pos`
    are touched only under `buf->lock`. Immutable-after-`new` fields (`data`, `content_length`,
-   `writer`) are read without it. `refcnt` uses GLib atomics. There is one lock — no ordering or
+   `writer`) are read without it. The refcount is the BEAM resource's (`enif_keep`/`release`). There is one lock — no ordering or
    nesting — and no spool function called under the lock re-takes it (see invariant 4 for the
    reentrancy guard).
 2. **Copies happen under the lock, in bounded slices.** Because the buffer is pre-allocated, `data`
@@ -414,9 +453,10 @@ thread.
 5. **Callbacks use native primitives only.** `read_cb`/`seek_cb` run on libvips threads and touch
    only `enif_mutex_*`/`enif_cond_*`, `memcpy`, `errno`, and immutable fields — never an
    `ErlNifEnv`, a term API, or a BEAM scheduler.
-6. **Refcount is balanced (GLib atomics).** `spool_ref` per new holder (write handle; each
-   `SpoolReader`), `spool_unref` per release (handle dtor; `spool_reader_free`). Freed once, by the
-   `spool_unref` that drops to 0.
+6. **Refcount is balanced (BEAM resource refcount).** `enif_keep_resource(buf)` per new holder
+   (write handle; each `SpoolReader`), `enif_release_resource(buf)` per release (handle dtor;
+   `spool_reader_free`). Freed once, by the release that drops to 0 — which must never be called
+   while holding `buf->lock` (the destructor would destroy the lock under you).
 7. **Terminal transitions wake all readers; writer *death* always causes one.** A parked reader is
    woken when bytes arrive, on any terminal transition, or by the monitor-down callback on writer
    death. It is **not** woken if the writer is alive but stalled forever (a hung upstream enum) —
@@ -434,12 +474,13 @@ documented as the caller's responsibility, not the primitive's.
 
 ## Lifetimes
 
-- **Writer:** the process that calls `new` (inside `start_feeder`); linked to the caller; fills to
-  exactly `content_length`, finalizes, exits. Bounded by `content_length`, not enum length.
-- **Buffer:** refcounted; outlives the writer. Once finalized, the complete buffer satisfies any
-  later lazy/random read with no writer involvement.
-- **Sources:** each holds a buffer ref via its `SpoolReader`; released when libvips unrefs the
-  `VipsSourceCustom`.
+- **Writer:** the process that calls `new` (inside `start_feeder`); **monitored** by the caller;
+  fills to exactly `content_length`, finalizes, exits. Bounded by `content_length`, not enum length.
+- **Buffer:** a `SPOOL_BUF_RT` resource; outlives the writer. Once finalized, the complete buffer
+  satisfies any later lazy/random read with no writer involvement.
+- **Sources:** each `keep`s the buffer resource via its `SpoolReader`; released when libvips unrefs
+  the `VipsSourceCustom`. Because the buffer is a NIF resource, a live source also keeps the NIF
+  library loaded (function-pointer safety across unload/upgrade).
 - **Returned lazy image retains its source (invariant + test).** The wrapper's `source` term goes
   out of scope when `new_from_enum_spool/2` returns, so correctness depends on the load operation
   holding its own ref to the `VipsSourceCustom` for the image's lazy lifetime. This is the same
@@ -447,36 +488,53 @@ documented as the caller's responsibility, not the primitive's.
   invariant here and covered by a GC-the-source-term-then-evaluate-pixels ASan test.
 - **Cancellation precedence:** explicit (`abort`/`finalize`) is primary; the writer's `try/rescue`
   handles in-process stream exceptions; the monitor down callback is the backstop for untrappable
-  death (`:kill`, link-propagated exit) — the case `try/rescue` cannot catch and the one that would
+  death (`:kill`, supervisor shutdown) — the case `try/rescue` cannot catch and the one that would
   otherwise deadlock a parked reader. The handle destructor is a last-resort backstop.
+- **NIF-monitor lifetime (verify + test):** the monitor is registered against the `SPOOL_WRITE_RT`
+  object. OTP auto-removes a monitor when its resource is deallocated and never runs the down
+  callback on a freed resource, so destructor↔down cannot race on freed memory — but this is the
+  single highest-risk C assumption and is pinned by a failure-injection test (writer alive, handle
+  GC'd, writer then dies → no use-after-free). `enif_demonitor_process` in the destructor is a
+  belt-and-suspenders option if the contract proves subtler on a supported OTP version.
 
 ## Error semantics (honest)
 
 | Event | What actually happens |
 |---|---|
-| Stream raises mid-feed | writer `rescue`s → `abort` (`ECANCELED`) → reader sees `ABORTED` → decode returns `{:error, _}`; the linked caller is **not** crashed |
-| Writer `:kill` / link-propagated exit | uncatchable by `rescue` → **monitor down** sets `ABORTED` (`EPIPE`) → parked reader returns `-1`. **But** because of `spawn_link`, the queued exit may still kill the caller after the dirty NIF returns, unless it traps exits — so this is *not* a guaranteed `{:error, _}` path |
-| Decode returns `{:error, _}` | parent (unparked) calls `abort` → next `write` returns `{:error, :aborted/:closed}` → `feed_spool` halts, writer stops draining |
+| Stream raises mid-feed | writer `rescue`s → `abort` (`EIO`, distinct from caller-cancel) → reader sees `ABORTED` → decode returns `{:error, _}`; caller **not** crashed |
+| Writer `:kill` / supervisor shutdown | uncatchable by `rescue` → **monitor down** sets `ABORTED` (`EPIPE`) → parked reader returns `-1`; with `spawn_monitor` the caller gets `{:DOWN}` as a *message*, so it returns `{:error, _}` — it is **not** killed |
+| Decode returns `{:error, _}` | parent (unparked) calls `abort` (`ECANCELED`) → next `write` returns `{:error, :aborted}` → `feed_spool` halts, writer stops draining |
 | Parent raises during decode setup | `catch` → `abort` → re-raise; feeder stopped |
 | `finalize` with `size < content_length` | `ABORTED`; `{:error, :short}` |
-| `write` after terminal | `{:error, :closed}` (post-DONE) or `{:error, :aborted}`; never silently appends |
+| `write` after terminal | `DONE` → `{:error, :closed}`; `ABORTED` → `{:error, :aborted}`; never silently appends |
 | `write`/`finalize` from non-writer pid | `{:error, :not_owner}` |
 | `seekable: true` without `content_length` | `{:error, :content_length_required}` before any work |
 | allocation fails at `new` | `{:error, :enomem}`, partials freed (no mid-stream alloc failure exists) |
 
 ## Memory and scheduler notes
 
-- The buffer holds `content_length` bytes (lazily committed) for the lifetime of its sources. If a
-  loader calls `vips_source_map`, peak RAM can **exceed** `new_from_buffer/2` (spool buffer + the
-  libvips `GByteArray` copy). This path trades RAM for the overlap/reopen wins; large/unknown inputs
-  use the pipe path.
-- `content_length` is the buffer size; `max_bytes` (Elixir-side policy cap) rejects a declared
-  length above policy at `new`.
-- The write NIF is `DIRTY_JOB_CPU_BOUND`; the decode (and its blocking read callback) already runs
-  on a dirty IO scheduler via `nif_vips_operation_call`. Each concurrently decoding source parks one
-  dirty-IO scheduler thread while waiting at the frontier (default pool ~10) — the same per-decode
-  characteristic as the pipe path. `abort`/`finalize`/`source` stay on regular schedulers and are
-  kept responsive by `SPOOL_MAX_SLICE`-bounded lock holds.
+- **`content_length` is reserved memory capacity, not free.** On many platforms `enif_alloc` is
+  lazily committed so unwritten pages cost no RSS, but this is not a portable guarantee — allocator
+  metadata, overcommit policy, and cgroup limits all matter, and an overcommitted huge allocation
+  can OOM-kill the process during streaming rather than fail cleanly at `new`. Callers must treat
+  `content_length` as the maximum resident footprint and rely on `max_bytes`. That is why
+  `max_bytes` defaults to a conservative library cap (100 MiB), **not** `content_length`.
+- If a loader calls `vips_source_map`, peak RAM can **exceed** `new_from_buffer/2` (spool buffer +
+  the libvips `GByteArray` copy). This path trades RAM for the overlap/reopen wins; large/unknown
+  inputs use the pipe path.
+- The write NIF is `DIRTY_JOB_CPU_BOUND` (memory-bandwidth + lock work, matching `nif_write`); a
+  large upload can occupy a dirty-CPU scheduler, so many concurrent large uploads add dirty-CPU
+  pressure — acceptable, but worth a stress test. The decode (and its blocking read callback) runs
+  on a dirty-IO scheduler via `nif_vips_operation_call`; each concurrently decoding source parks one
+  dirty-IO thread while waiting at the frontier (default pool ~10) — the same per-decode
+  characteristic as the pipe path, and a reason services should bound concurrent decodes per node.
+  `abort`/`finalize`/`source` stay on regular schedulers, kept responsive by the lock-per-slice
+  write loop.
+- **errno portability.** Callbacks set `errno` on every `-1`; libvips may flatten these into a
+  generic decode error, so they are diagnostic, not a contract callers can switch on. `ENODATA` and
+  `ECANCELED` are **not** universally available (notably `ENODATA` on macOS, a supported target) —
+  guard them (`#ifndef … #define … EIO`) or use `EIO`. `spool_set_terminal_locked` must never record
+  errno `0` for `ABORTED`.
 
 ## Testing
 
@@ -504,14 +562,19 @@ Validation / safety:
   pulled again — the writer must `finalize` without requesting the extra item.
 
 Process semantics:
-- Writer `:kill` with a non-trapping caller vs. a trapping caller → behavior matches the honest
-  table (caller may exit; or `{:EXIT}` branch returns `{:error, _}`).
-- Caller traps exits and the writer dies before sending the handle → `start_feeder` returns
-  `{:error, _}`, no hang.
+- Writer `:kill` → caller (via `spawn_monitor`) gets `{:error, _}`, is **not** killed, regardless of
+  `trap_exit`; the parked reader wakes with `-1` via the monitor.
+- Writer dies before sending the handle → `start_feeder` returns `{:error, _}` via `{:DOWN}`, no hang.
 - Decode returns `{:error, _}` on a large/slow enum → feeder aborted, RAM stops growing.
-- **Monitor-ownership regression:** mint the spool via `start_feeder` (correct), kill the feeder
-  while a reader is parked → reader wakes with `-1`. (And a deliberately-wrong manual `new`-in-parent
-  setup demonstrates the footgun the API prevents.)
+- **Abort responsiveness during a huge write:** start a multi-MB `write/2`, `abort/1` from another
+  process, assert the write stops within ~one `SPOOL_MAX_SLICE` of progress (catches any regression
+  to lock-held-across-the-whole-loop).
+- **`content_length == 0`:** a feeder over a zero-length enum that blocks/raises if pulled →
+  `finalize` runs without touching the enum.
+- **`timeout:`** option → a stalled-but-alive writer is aborted by the watchdog and the call returns
+  an error rather than parking forever.
+- **Monitor-ownership regression:** mint via `start_feeder` (correct), kill the feeder while a reader
+  is parked → reader wakes with `-1`.
 
 Lifetime (ASan/valgrind):
 - Source GC'd while writer/spool alive; spool handle GC'd while a source is still decoding.
@@ -526,6 +589,45 @@ Lifetime (ASan/valgrind):
 Multi-reader:
 - `source/1` ×N over one spool; concurrent decodes with independent cursors; probe-then-shrink-load
   on a still-arriving body. `source/1` after `DONE` works; after `ABORTED` → `{:error, :aborted}`.
+
+## Implementation checklist (carried into the plan)
+
+These are binding C-safety/idiom requirements that belong in the implementation plan as concrete
+tasks rather than in the design prose. They do not change the architecture.
+
+Resource & monitor lifetime:
+- `SPOOL_BUF_RT` and `SPOOL_WRITE_RT` resource types each opened with the right destructor (and
+  `SPOOL_WRITE_RT` with a down callback). Verify the exact `enif_monitor_process` lifetime contract
+  on supported OTP; consider `enif_demonitor_process` in the write-handle destructor.
+- Never call the releasing `enif_release_resource(buf)` while holding `buf->lock`.
+- Monitor-down and destructor must both go through `spool_set_terminal` (idempotent, first wins).
+
+Allocation & integer safety:
+- One named helper for `gint64 → size_t` and one for checked `gint64 + gint64`; cast to `size_t`
+  only after proving `0 <= n <= SIZE_MAX`. Validate `0 <= content_length <= G_MAXINT64` and
+  `<= SIZE_MAX` before `enif_alloc`. Compute `content_length - size` only after asserting
+  `0 <= size <= content_length` (debug `assert`).
+- Replace the illustrative `MIN3` with explicit typed clamping (no signed/unsigned promotion).
+- `SPOOL_MAX_SLICE` a `size_t` constant bounded into both `gint64` and `size_t`.
+
+Locking & callbacks:
+- `enif_cond_wait` only ever inside a `while`; broadcast after every published-bytes advance and on
+  every terminal transition.
+- `read_cb`: `length < 0`/NULL buffer → `-1`/`EINVAL`; `length == 0` → `0`; block at frontier while
+  `OPEN`; `0` only after `DONE`; `-1` (with stored `err_errno`, fallback `EIO`) after `ABORTED`.
+- `seek_cb`: validate `whence`, overflow, and `0 <= new_pos <= content_length`; `SEEK_END` returns
+  `content_length`, never `size`; never waits.
+- Callbacks touch only native primitives — no `ErlNifEnv`, term API, message send, or logging.
+
+GObject ownership:
+- Exactly one owning destroy notify (`g_object_set_data_full`) for the `SpoolReader`; signal
+  handlers non-owning; no per-signal `GClosureNotify`. Every failure path after `enif_keep_resource`
+  proves exactly one `enif_release_resource`.
+
+Elixir:
+- `validate_content_length/2` (integer, non-negative, `<= max_bytes`) and `validate_options/1` run
+  **before** spawning the feeder. `default_max_bytes/0` reads app config (100 MiB default).
+- `start_watchdog/2` spawns a process that `abort/1`s on `timeout`, cancelled via `:done`.
 
 ## Deferred (not v1)
 
