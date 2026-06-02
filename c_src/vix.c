@@ -180,6 +180,8 @@ static ErlNifFunc nif_funcs[] = {
 
     /* VipsSourceCustom spool */
     {"nif_source_spool_new", 1, nif_source_spool_new, 0},
+    {"nif_source_spool_write", 2, nif_source_spool_write,
+     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_source_spool_finalize", 1, nif_source_spool_finalize, 0},
     {"nif_source_spool_abort", 1, nif_source_spool_abort, 0}};
 

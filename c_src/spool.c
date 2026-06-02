@@ -191,6 +191,59 @@ ERL_NIF_TERM nif_source_spool_new(ErlNifEnv *env, int argc,
   return make_ok(env, term);
 }
 
+/* ---- write ---- */
+
+ERL_NIF_TERM nif_source_spool_write(ErlNifEnv *env, int argc,
+                                    const ERL_NIF_TERM argv[]) {
+  ASSERT_ARGC(argc, 2);
+
+  SpoolWriteHandle *wr;
+  if (!enif_get_resource(env, argv[0], SPOOL_WRITE_RT, (void **)&wr))
+    return make_error(env, "invalid spool handle");
+  if (!is_writer(env, wr))
+    return make_error_term(env, make_atom(env, "not_owner"));
+
+  ErlNifBinary bin;
+  if (!enif_inspect_binary(env, argv[1], &bin))
+    return make_error(env, "failed to get binary");
+
+  SpoolBuf *b = wr->buf;
+  size_t off = 0;
+
+  while (off < bin.size) {
+    enif_mutex_lock(b->lock);
+
+    if (b->state == SPOOL_DONE) {
+      enif_mutex_unlock(b->lock);
+      return make_error_term(env, make_atom(env, "closed"));
+    }
+    if (b->state == SPOOL_ABORTED) {
+      enif_mutex_unlock(b->lock);
+      return make_error_term(env, make_atom(env, "aborted"));
+    }
+
+    /* would this binary exceed the declared length? (size <= content_length) */
+    if ((gint64)(bin.size - off) > b->content_length - b->size) {
+      spool_set_terminal_locked(b, SPOOL_ABORTED, EFBIG);
+      enif_mutex_unlock(b->lock);
+      return make_error_term(env, make_atom(env, "overflow"));
+    }
+
+    size_t slice = bin.size - off;
+    if (slice > SPOOL_MAX_SLICE)
+      slice = SPOOL_MAX_SLICE;
+
+    memcpy(b->data + b->size, (const guint8 *)bin.data + off, slice);
+    b->size += (gint64)slice;
+    enif_cond_broadcast(b->cond);
+
+    enif_mutex_unlock(b->lock); /* release BETWEEN slices (invariant 2) */
+    off += slice;
+  }
+
+  return ATOM_OK;
+}
+
 /* ---- finalize ---- */
 
 static int is_writer(ErlNifEnv *env, SpoolWriteHandle *wr) {

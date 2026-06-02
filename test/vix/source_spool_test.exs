@@ -23,4 +23,29 @@ defmodule Vix.SourceSpoolTest do
     # finalize after abort reports the terminal cause
     assert {:error, :aborted} = SourceSpool.finalize(spool2)
   end
+
+  test "write/2 enforces single-writer, declared length, and terminal state" do
+    {:ok, spool} = SourceSpool.new(content_length: 5)
+
+    # not the writer -> :not_owner
+    task =
+      Task.async(fn -> SourceSpool.write(spool, "x") end)
+
+    assert {:error, :not_owner} = Task.await(task)
+
+    assert :ok = SourceSpool.write(spool, "abc")
+    # writing past content_length aborts with :overflow
+    assert {:error, :overflow} = SourceSpool.write(spool, "defg")
+    # spool is now ABORTED; further writes are rejected
+    assert {:error, :aborted} = SourceSpool.write(spool, "h")
+  end
+
+  test "write/2 then exact-fill finalize succeeds" do
+    {:ok, spool} = SourceSpool.new(content_length: 5)
+    assert :ok = SourceSpool.write(spool, "ab")
+    assert :ok = SourceSpool.write(spool, "cde")
+    assert :ok = SourceSpool.finalize(spool)
+    # write after DONE -> :closed
+    assert {:error, :closed} = SourceSpool.write(spool, "x")
+  end
 end

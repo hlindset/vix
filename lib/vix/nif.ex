@@ -279,6 +279,9 @@ defmodule Vix.Nif do
   def nif_source_spool_new(_content_length),
     do: :erlang.nif_error(:nif_library_not_loaded)
 
+  def nif_source_spool_write(_spool, _bin),
+    do: :erlang.nif_error(:nif_library_not_loaded)
+
   def nif_source_spool_finalize(_spool),
     do: :erlang.nif_error(:nif_library_not_loaded)
 

@@ -31,6 +31,10 @@ defmodule Vix.SourceSpool do
     end
   end
 
+  @spec write(t, binary) :: :ok | {:error, :closed | :aborted | :overflow | :not_owner}
+  def write(%SourceSpool{ref: ref}, bin) when is_binary(bin),
+    do: Nif.nif_source_spool_write(ref, bin)
+
   @spec finalize(t) :: :ok | {:error, term}
   def finalize(%SourceSpool{ref: ref}), do: Nif.nif_source_spool_finalize(ref)
 
