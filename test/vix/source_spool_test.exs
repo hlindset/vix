@@ -173,4 +173,30 @@ defmodule Vix.SourceSpoolTest do
                SourceSpool.start_feeder(enum, content_length: 0)
     end
   end
+
+  test "two independent sources over one spool decode the same bytes" do
+    bytes = File.read!(img_path("boats.tif"))
+    {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+    :ok = SourceSpool.write(spool, bytes)
+    :ok = SourceSpool.finalize(spool)
+
+    {:ok, s1} = SourceSpool.source(spool)
+    {:ok, s2} = SourceSpool.source(spool)
+
+    {:ok, i1} = decode_source(s1)
+    {:ok, i2} = decode_source(s2)
+    assert Image.width(i1) == Image.width(i2)
+    assert Image.height(i1) == Image.height(i2)
+  end
+
+  test "all spool NIFs are registered (not stub-raising)" do
+    # If a vix.c table entry is mis-bound, the NIF stays the .ex stub and raises
+    # :nif_library_not_loaded. A successful new/finalize exercises new+finalize;
+    # write/source/abort are covered by the tests above. This asserts the load.
+    assert {:ok, spool} = SourceSpool.new(content_length: 1)
+    assert :ok = SourceSpool.write(spool, "x")
+    assert {:ok, _source} = SourceSpool.source(spool)
+    assert :ok = SourceSpool.finalize(spool)
+    assert :ok = SourceSpool.abort(spool)
+  end
 end
