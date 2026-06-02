@@ -249,6 +249,8 @@ ERL_NIF_TERM nif_source_spool_new(ErlNifEnv *env, int argc,
 #endif
 
   SpoolBuf *buf = enif_alloc_resource(SPOOL_BUF_RT, sizeof(SpoolBuf));
+  if (!buf)
+    return make_error_term(env, make_atom(env, "enomem"));
   buf->lock = NULL;
   buf->cond = NULL;
   buf->data = NULL;
@@ -268,6 +270,10 @@ ERL_NIF_TERM nif_source_spool_new(ErlNifEnv *env, int argc,
 
   SpoolWriteHandle *wr =
       enif_alloc_resource(SPOOL_WRITE_RT, sizeof(SpoolWriteHandle));
+  if (!wr) {
+    enif_release_resource(buf);
+    return make_error_term(env, make_atom(env, "enomem"));
+  }
   wr->buf = buf; /* wr owns buf's creation ref; dtor will release it */
   enif_self(env, &wr->writer);
 
@@ -289,8 +295,7 @@ ERL_NIF_TERM nif_source_spool_new(ErlNifEnv *env, int argc,
 static int is_writer(ErlNifEnv *env, SpoolWriteHandle *wr) {
   ErlNifPid self;
   enif_self(env, &self);
-  return enif_is_identical(enif_make_pid(env, &self),
-                           enif_make_pid(env, &wr->writer));
+  return enif_compare_pids(&self, &wr->writer) == 0; /* OTP 22+; no term alloc */
 }
 
 ERL_NIF_TERM nif_source_spool_finalize(ErlNifEnv *env, int argc,
@@ -303,6 +308,8 @@ ERL_NIF_TERM nif_source_spool_finalize(ErlNifEnv *env, int argc,
     return make_error_term(env, make_atom(env, "not_owner"));
 
   SpoolBuf *b = wr->buf;
+  if (!b) /* NULL only after the dtor ran; mirror abort/1's guard */
+    return make_error_term(env, make_atom(env, "aborted"));
   ERL_NIF_TERM ret;
   enif_mutex_lock(b->lock);
   if (b->state == SPOOL_OPEN) {
