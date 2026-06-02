@@ -560,5 +560,20 @@ defmodule Vix.Vips.ImageTest do
       assert {:error, :content_length_required} =
                Image.new_from_enum(enum, seekable: true)
     end
+
+    # (4) :timeout watchdog — the ONLY liveness mechanism for a live-but-stalled producer (the
+    # monitor only fires on death). A stalled feeder must yield {:error,_}, not hang.
+    @tag timeout: 10_000
+    test "seekable :timeout aborts a stalled feeder instead of hanging" do
+      enum = Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
+
+      assert {:error, _} =
+               Image.new_from_enum(enum, seekable: true, content_length: 1000, timeout: 300)
+    end
+
+    test "seekable rejects an invalid :timeout before doing any work" do
+      assert {:error, :invalid_timeout} =
+               Image.new_from_enum([<<>>], seekable: true, content_length: 1, timeout: 0)
+    end
   end
 end

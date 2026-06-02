@@ -200,6 +200,94 @@ defmodule Vix.SourceSpoolTest do
     assert :ok = SourceSpool.abort(spool)
   end
 
+  # Helper: an enum that yields nothing and blocks forever if pulled.
+  defp blocking_enum,
+    do: Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
+
+  # (1) The design's "single most important contract": start_feeder makes the FEEDER the
+  # monitored writer. Killing the feeder (not the test process) must wake a parked reader.
+  @tag timeout: 10_000
+  test "start_feeder monitors the feeder: killing it wakes a parked reader" do
+    {:ok, spool, writer} =
+      SourceSpool.start_feeder(blocking_enum(), content_length: 1000)
+
+    {:ok, source} = SourceSpool.source(spool)
+    parent = self()
+    _decoder = spawn_link(fn -> send(parent, {:res, decode_source(source)}) end)
+
+    Process.sleep(50)            # decoder parks at the frontier (nothing written yet)
+    Process.exit(writer, :kill)  # feeder is the monitored writer
+    assert_receive {:res, {:error, _}}, 5_000
+  end
+
+  # (2) The spawn_monitor payoff: a feeder :kill surfaces as an API error, never crashes the
+  # caller — even when the caller traps exits.
+  @tag timeout: 10_000
+  test "a feeder :kill does not crash the caller; the spool reports :aborted" do
+    Process.flag(:trap_exit, true)
+    {:ok, spool, writer} = SourceSpool.start_feeder(blocking_enum(), content_length: 1000)
+    Process.exit(writer, :kill)
+    Process.sleep(50)
+    assert {:error, :aborted} = SourceSpool.source(spool)  # caller still alive & usable
+  after
+    Process.flag(:trap_exit, false)
+  end
+
+  # (3) Short stream: finalize before content_length aborts with :short.
+  test "finalize before content_length returns :short" do
+    {:ok, spool} = SourceSpool.new(content_length: 10)
+    :ok = SourceSpool.write(spool, "abc")
+    assert {:error, :short} = SourceSpool.finalize(spool)
+  end
+
+  # (5) Abort responsiveness: abort concurrent with a large multi-slice write must not deadlock.
+  # (The "stops within ~one SPOOL_MAX_SLICE" property is structural — verify by reading the
+  # lock-per-slice loop; this test guards against a deadlock regression.)
+  @tag timeout: 10_000
+  test "abort/1 concurrent with a large write does not deadlock" do
+    big = :binary.copy("x", 8 * 1024 * 1024)
+    {:ok, spool} = SourceSpool.new(content_length: byte_size(big))
+    spawn(fn -> SourceSpool.abort(spool) end)
+    assert SourceSpool.write(spool, big) in [:ok, {:error, :aborted}]
+  end
+
+  # (6) SEEK_END length-cache pin. A TIFF loader probes source length early (SEEK_END). Feeding a
+  # TIFF in two halves and decoding correctly proves SEEK_END returns content_length, NOT the
+  # write frontier — the exact bug the content_length requirement defends against. (A truly direct
+  # seek-callback unit test isn't possible from Elixir; this end-to-end shape is the real pin.)
+  @tag timeout: 10_000
+  test "TIFF fed incrementally decodes — SEEK_END returns content_length, not the frontier" do
+    bytes = File.read!(img_path("boats.tif"))
+    half = div(byte_size(bytes), 2)
+    <<first::binary-size(half), rest::binary>> = bytes
+
+    {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+    {:ok, source} = SourceSpool.source(spool)
+    parent = self()
+    _decoder = spawn_link(fn -> send(parent, {:res, decode_source(source)}) end)
+
+    :ok = SourceSpool.write(spool, first)
+    :ok = SourceSpool.write(spool, rest)
+    :ok = SourceSpool.finalize(spool)
+    assert_receive {:res, {:ok, _img}}, 5_000
+  end
+
+  # (7) source/1 after abort returns :aborted, synchronously (direct unit).
+  test "source/1 after abort returns :aborted" do
+    {:ok, spool} = SourceSpool.new(content_length: 10)
+    :ok = SourceSpool.abort(spool)
+    assert {:error, :aborted} = SourceSpool.source(spool)
+  end
+
+  # (8) Zero-length source: bounded EOF, decode errors rather than hanging.
+  @tag timeout: 10_000
+  test "zero-length source decodes to an error without hanging" do
+    {:ok, spool} = SourceSpool.new(content_length: 0)
+    :ok = SourceSpool.finalize(spool)
+    {:ok, source} = SourceSpool.source(spool)
+    assert {:error, _} = decode_source(source)
+  end
+
   test "image retains its source: buffer survives GC of BOTH the spool handle and the source term" do
     bytes = File.read!(img_path("puppies.jpg"))
 
