@@ -183,6 +183,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_source_spool_write", 2, nif_source_spool_write,
      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_source_spool_finalize", 1, nif_source_spool_finalize, 0},
-    {"nif_source_spool_abort", 1, nif_source_spool_abort, 0}};
+    {"nif_source_spool_abort", 1, nif_source_spool_abort, 0},
+    {"nif_source_spool_source", 1, nif_source_spool_source, 0}};
 
 ERL_NIF_INIT(Elixir.Vix.Nif, nif_funcs, &on_load, NULL, NULL, NULL)

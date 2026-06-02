@@ -297,3 +297,136 @@ ERL_NIF_TERM nif_source_spool_abort(ErlNifEnv *env, int argc,
     spool_set_terminal(wr->buf, SPOOL_ABORTED, ECANCELED);
   return ATOM_OK;
 }
+
+/* ---- source/1 + read/seek callbacks ---- */
+
+/* Owns the SpoolReader; the single GObject destroy notify (no per-signal free). */
+static void spool_reader_free(gpointer data) {
+  SpoolReader *r = (SpoolReader *)data;
+  enif_release_resource(r->buf); /* never under buf->lock */
+  enif_free(r);
+}
+
+static gint64 spool_read_cb(VipsSourceCustom *source, void *buffer,
+                            gint64 length, void *user_data) {
+  (void)source;
+  SpoolReader *r = (SpoolReader *)user_data;
+  SpoolBuf *b = r->buf;
+
+  if (length < 0 || buffer == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (length == 0)
+    return 0;
+
+  enif_mutex_lock(b->lock);
+  while (r->read_pos >= b->size && b->state == SPOOL_OPEN)
+    enif_cond_wait(b->cond, b->lock); /* park at the frontier */
+
+  if (b->state == SPOOL_ABORTED) {
+    errno = b->err_errno ? b->err_errno : EIO;
+    enif_mutex_unlock(b->lock);
+    return -1;
+  }
+  if (r->read_pos >= b->size) { /* DONE, at/after end -> true EOF */
+    enif_mutex_unlock(b->lock);
+    return 0;
+  }
+
+  gint64 avail = b->size - r->read_pos; /* > 0 */
+  gint64 n = length < avail ? length : avail;
+  if (n > (gint64)SPOOL_MAX_SLICE)
+    n = (gint64)SPOOL_MAX_SLICE;
+
+  memcpy(buffer, b->data + r->read_pos, (size_t)n);
+  r->read_pos += n;
+  enif_mutex_unlock(b->lock);
+  return n;
+}
+
+static gint64 spool_seek_cb(VipsSourceCustom *source, gint64 offset, int whence,
+                            void *user_data) {
+  (void)source;
+  SpoolReader *r = (SpoolReader *)user_data;
+  SpoolBuf *b = r->buf;
+  gint64 base, new_pos;
+
+  enif_mutex_lock(b->lock);
+  switch (whence) {
+  case SEEK_SET:
+    base = 0;
+    break;
+  case SEEK_CUR:
+    base = r->read_pos;
+    break;
+  case SEEK_END:
+    base = b->content_length; /* stable, declared up front */
+    break;
+  default:
+    enif_mutex_unlock(b->lock);
+    errno = EINVAL;
+    return -1;
+  }
+
+  /* overflow + range check; positions are gint64 */
+  if ((offset > 0 && base > G_MAXINT64 - offset) ||
+      (offset < 0 && base < G_MININT64 - offset)) {
+    enif_mutex_unlock(b->lock);
+    errno = EINVAL;
+    return -1;
+  }
+  new_pos = base + offset;
+  if (new_pos < 0 || new_pos > b->content_length) {
+    enif_mutex_unlock(b->lock);
+    errno = EINVAL;
+    return -1;
+  }
+
+  r->read_pos = new_pos;
+  enif_mutex_unlock(b->lock);
+  return new_pos;
+}
+
+ERL_NIF_TERM nif_source_spool_source(ErlNifEnv *env, int argc,
+                                     const ERL_NIF_TERM argv[]) {
+  ASSERT_ARGC(argc, 1);
+
+  SpoolWriteHandle *wr;
+  if (!enif_get_resource(env, argv[0], SPOOL_WRITE_RT, (void **)&wr))
+    return make_error(env, "invalid spool handle");
+
+  SpoolBuf *b = wr->buf;
+
+  enif_mutex_lock(b->lock);
+  if (b->state == SPOOL_ABORTED) {
+    enif_mutex_unlock(b->lock);
+    return make_error_term(env, make_atom(env, "aborted"));
+  }
+  enif_keep_resource(b); /* this reader's ref */
+  enif_mutex_unlock(b->lock);
+
+  SpoolReader *r = enif_alloc(sizeof(SpoolReader));
+  if (!r) {
+    enif_release_resource(b);
+    return make_error_term(env, make_atom(env, "enomem"));
+  }
+  r->buf = b;
+  r->read_pos = 0;
+
+  VipsSourceCustom *sc = vips_source_custom_new();
+  if (!sc) {
+    enif_release_resource(b);
+    enif_free(r);
+    return make_error(env, "failed to create VipsSourceCustom");
+  }
+
+  /* single owning destroy notify; signal handlers are non-owning */
+  g_object_set_data_full(G_OBJECT(sc), "vix-spool-reader", r, spool_reader_free);
+  g_signal_connect(sc, "read", G_CALLBACK(spool_read_cb), r);
+  g_signal_connect(sc, "seek", G_CALLBACK(spool_seek_cb), r);
+
+  /* g_object_to_erl_term takes ownership into a BEAM resource (which also pins
+     the NIF library while the source lives). */
+  return make_ok(env, g_object_to_erl_term(env, (GObject *)sc));
+}

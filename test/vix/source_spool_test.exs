@@ -3,6 +3,20 @@ defmodule Vix.SourceSpoolTest do
 
   alias Vix.SourceSpool
 
+  import Vix.Support.Images
+  alias Vix.Vips.Image
+
+  # Decode a Vix.Vips.Source via the same internal path new_from_enum uses.
+  # operation_call's first output is already a wrapped %Image{} (same as the
+  # `wrap_type(ref)` new_from_enum applies — wrap_type is a no-op on a struct).
+  defp decode_source(%Vix.Vips.Source{} = source) do
+    with {:ok, loader} <- Vix.Vips.Foreign.find_load_source(source),
+         {:ok, {%Image{} = image, _}} <-
+           Vix.Vips.Operation.Helper.operation_call(loader, [source], []) do
+      {:ok, image}
+    end
+  end
+
   test "new/1 requires a non-negative integer content_length within max_bytes" do
     assert {:error, :content_length_required} = SourceSpool.new([])
     assert {:error, :invalid_content_length} = SourceSpool.new(content_length: -1)
@@ -47,5 +61,19 @@ defmodule Vix.SourceSpoolTest do
     assert :ok = SourceSpool.finalize(spool)
     # write after DONE -> :closed
     assert {:error, :closed} = SourceSpool.write(spool, "x")
+  end
+
+  test "source/1 over a fully-spooled JPEG decodes to the same shape as the file" do
+    bytes = File.read!(img_path("puppies.jpg"))
+    {:ok, ref} = Image.new_from_file(img_path("puppies.jpg"))
+    expected = {Image.width(ref), Image.height(ref), Image.bands(ref)}
+
+    {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+    :ok = SourceSpool.write(spool, bytes)
+    :ok = SourceSpool.finalize(spool)
+    {:ok, source} = SourceSpool.source(spool)
+
+    {:ok, img} = decode_source(source)
+    assert {Image.width(img), Image.height(img), Image.bands(img)} == expected
   end
 end

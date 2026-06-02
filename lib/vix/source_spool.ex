@@ -41,6 +41,13 @@ defmodule Vix.SourceSpool do
   @spec abort(t) :: :ok
   def abort(%SourceSpool{ref: ref}), do: Nif.nif_source_spool_abort(ref)
 
+  @spec source(t) :: {:ok, Vix.Vips.Source.t()} | {:error, :aborted | term}
+  def source(%SourceSpool{ref: ref}) do
+    with {:ok, src_ref} <- Nif.nif_source_spool_source(ref) do
+      {:ok, %Source{ref: src_ref}}
+    end
+  end
+
   @doc false
   def default_max_bytes,
     do: Application.get_env(:vix, :source_spool_max_bytes, @default_max_bytes)
