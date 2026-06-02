@@ -670,15 +670,20 @@ Expected: FAIL — `SourceSpool.source/1` undefined.
 
 - [ ] **Step 4: Add callbacks + `source/1` to `c_src/spool.c`** (after `nif_source_spool_abort`):
 
-> **VERIFY FIRST (the one unverifiable-from-the-plan risk):** `G_CALLBACK` casts away the handler
-> prototype, so a mismatch between `spool_read_cb`/`spool_seek_cb` and the actual libvips
-> `VipsSourceCustom` `"read"`/`"seek"` signal signatures compiles clean and corrupts the stack at
-> decode time. Before trusting the signatures below, open the header you compile against —
-> `priv/precompiled_libvips/include/vips/sourcecustom.h` (populated after the first `mix compile`) —
-> and confirm `VipsSourceCustomReadSignal` is `gint64 (*)(VipsSourceCustom *, void *buffer, gint64 length, gpointer)`
-> and `VipsSourceCustomSeekSignal` is `gint64 (*)(VipsSourceCustom *, gint64 offset, int whence, gpointer)`.
-> Match the parameter order/types/return verbatim. The Task 3 JPEG decode is the smoke test: if the
-> ABI is wrong it crashes or returns garbage there.
+> **VERIFIED (libvips 8.18.2):** `G_CALLBACK` casts away the handler prototype, so a callback-signature
+> mismatch compiles clean and corrupts the stack at decode time. The signatures below were checked
+> against the actual header — `_build/dev/lib/vix/priv/precompiled_libvips/include/vips/connection.h`
+> (`VipsSourceCustom` lives in `connection.h`, not a separate `sourcecustom.h`), `VipsSourceCustomClass`
+> lines 279-280:
+> ```c
+> gint64 (*read)(VipsSourceCustom *source, void *buffer, gint64 length);
+> gint64 (*seek)(VipsSourceCustom *source, gint64 offset, int whence);
+> ```
+> With the trailing `g_signal_connect` `user_data`, the handler signatures are
+> `gint64 (VipsSourceCustom *, void *buffer, gint64 length, gpointer)` and
+> `gint64 (VipsSourceCustom *, gint64 offset, int whence, gpointer)` — exactly what `spool_read_cb`/
+> `spool_seek_cb` use (note `read` length is `gint64`, not `size_t`). Re-confirm if the libvips
+> version changes; the Task 3 JPEG decode is the smoke test.
 
 ```c
 /* Owns the SpoolReader; the single GObject destroy notify (no per-signal free). */
