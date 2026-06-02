@@ -95,6 +95,7 @@ ERL_NIF_TERM nif_source_spool_source(ErlNifEnv *env, int argc,
 ```c
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>  /* SEEK_SET / SEEK_CUR / SEEK_END */
 #include <string.h>
 
 #include <glib-object.h>
@@ -142,6 +143,12 @@ typedef struct {
   ErlNifPid writer;
   ErlNifMonitor mon;
 } SpoolWriteHandle;
+
+/* Forward decl: write/2 (added in Task 2, after `new`) calls is_writer, which is
+   defined further down. Declare it here so insertion order can't break -Werror.
+   wr->buf is immutable from `new` until the write-handle dtor, and the resource is
+   alive for the duration of any NIF call / down callback that reads it. */
+static int is_writer(ErlNifEnv *env, SpoolWriteHandle *wr);
 
 /* ---- terminal-state chokepoint (invariant 4) ---- */
 
@@ -321,6 +328,12 @@ ERL_NIF_TERM nif_source_spool_abort(ErlNifEnv *env, int argc,
 }
 ```
 
+> **VERIFY (OTP monitor API):** confirm `enif_monitor_process(env, obj, pid, mon)` and
+> `enif_demonitor_process(env, obj, mon)` signatures against the OTP you build against — the 2nd arg
+> is the **resource object pointer** (`wr`), not a term, and the monitored object must be valid in
+> the down/dtor pairing. `pipe.c`'s `fd_to_erl_term` uses `enif_monitor_process` the same way; mirror
+> it. (Same class of "compiles-but-wrong" risk as the libvips signal note in Task 3.)
+
 - [ ] **Step 3: Wire into `c_src/vix.c`** — add the include with the other local headers (near [vix.c:11](../../../c_src/vix.c)):
 
 ```c
@@ -364,9 +377,12 @@ defmodule Vix.SourceSpool do
   A seekable, concurrent libvips source backed by a pre-allocated in-memory
   buffer fed from Elixir while libvips decodes.
 
-  Prefer `start_feeder/2`. `new/1`, `write/2`, and `finalize/1` are low-level:
-  the process that calls `new/1` becomes the only process allowed to `write/2`
-  and `finalize/1`, and its death aborts the spool.
+  Prefer `start_feeder/2`: it starts a feeder process that owns writes/finalization
+  and returns a spool handle for `source/1` and `abort/1`. The feeder stays the
+  writer — the caller must not `write/2`/`finalize/1`. `new/1`, `write/2`, and
+  `finalize/1` are low-level: the process that calls `new/1` becomes the only
+  process allowed to `write/2`/`finalize/1`, and its death aborts the spool.
+  `abort/1` is callable from any process holding the handle.
   """
 
   alias Vix.Nif
@@ -979,8 +995,14 @@ Expected: FAIL — `SourceSpool.start_feeder/2` undefined.
 ```elixir
   @spec start_feeder(Enumerable.t(), keyword) :: {:ok, t, pid} | {:error, term}
   def start_feeder(enum, opts) do
+    case Keyword.fetch(opts, :content_length) do
+      :error -> {:error, :content_length_required}   # don't raise; match the rest of the API
+      {:ok, len} -> do_start_feeder(enum, opts, len)
+    end
+  end
+
+  defp do_start_feeder(enum, opts, len) do
     parent = self()
-    len = Keyword.fetch!(opts, :content_length)
 
     {writer, mon} =
       spawn_monitor(fn ->
@@ -1016,17 +1038,21 @@ Expected: FAIL — `SourceSpool.start_feeder/2` undefined.
     try do
       enum
       |> Enum.reduce_while(0, fn iodata, written ->
-        bin = IO.iodata_to_binary(iodata)
+        case IO.iodata_to_binary(iodata) do
+          "" ->
+            {:cont, written}   # skip empty chunks (no-op write; avoids pathological spins)
 
-        case write(spool, bin) do
-          :ok ->
-            case written + byte_size(bin) do
-              ^len -> finalize(spool); {:halt, :filled}
-              n -> {:cont, n}
+          bin ->
+            case write(spool, bin) do
+              :ok ->
+                case written + byte_size(bin) do
+                  ^len -> finalize(spool); {:halt, :filled}
+                  n -> {:cont, n}
+                end
+
+              {:error, _} ->
+                {:halt, :stopped}
             end
-
-          {:error, _} ->
-            {:halt, :stopped}
         end
       end)
       |> case do
@@ -1129,10 +1155,11 @@ Replace the `def new_from_enum(enum, opts \\ []) do … end` head ([image.ex:701
     {max, opts} = Keyword.pop(opts, :max_bytes, Vix.SourceSpool.default_max_bytes())
 
     with :ok <- validate_spool_length(len, max),
+         :ok <- validate_timeout(timeout),
          :ok <- validate_options(opts),    # parity with the pipe path (validate_options is defp here)
-         {:ok, spool, _writer} <-
+         {:ok, spool, writer} <-
            Vix.SourceSpool.start_feeder(enum, content_length: len, max_bytes: max) do
-      watchdog = timeout && start_spool_watchdog(spool, timeout)
+      watchdog = if timeout, do: start_spool_watchdog(spool, writer, timeout)
 
       try do
         with {:ok, source} <- Vix.SourceSpool.source(spool),
@@ -1150,7 +1177,7 @@ Replace the `def new_from_enum(enum, opts \\ []) do … end` head ([image.ex:701
           Vix.SourceSpool.abort(spool)
           :erlang.raise(kind, reason, __STACKTRACE__)
       after
-        watchdog && send(watchdog, :done)
+        if watchdog, do: send(watchdog, :done)
       end
     end
   end
@@ -1166,12 +1193,20 @@ Replace the `def new_from_enum(enum, opts \\ []) do … end` head ([image.ex:701
 
   defp validate_spool_length(_len, _max), do: :ok
 
-  defp start_spool_watchdog(spool, timeout) do
+  defp validate_timeout(nil), do: :ok
+  defp validate_timeout(t) when is_integer(t) and t > 0, do: :ok
+  defp validate_timeout(_), do: {:error, :invalid_timeout}
+
+  # The watchdog both aborts the spool (wakes parked readers) AND kills the feeder.
+  # Abort alone wakes readers but leaves a live-but-stalled producer blocked in the enum.
+  defp start_spool_watchdog(spool, writer, timeout) do
     spawn(fn ->
       receive do
         :done -> :ok
       after
-        timeout -> Vix.SourceSpool.abort(spool)
+        timeout ->
+          Vix.SourceSpool.abort(spool)
+          Process.exit(writer, :kill)
       end
     end)
   end
@@ -1290,7 +1325,7 @@ Run:
 ERL_FLAGS="+S 1" valgrind --leak-check=full --error-exitcode=1 \
   mix test test/vix/source_spool_test.exs test/vix/vips/image_test.exs
 ```
-Expected: no "definitely lost" from spool allocations, no invalid free. (macOS: use `leaks` or an ASan-instrumented build instead; valgrind support is limited.)
+Expected: no invalid reads/writes/frees, and no "definitely lost" allocations **attributable to spool resources** (`SpoolBuf`/`SpoolReader`/`data`). Erlang, GLib, and libvips produce their own one-time/cached allocations and benign noise — judge spool-attributable findings, not a totally clean whole-process run; add suppressions if needed. (macOS: use `leaks` or an ASan-instrumented build; valgrind support is limited.)
 This exercises: buffer freed once at refcount 0, single reader destroy notify (no double-free), monitor/dtor interplay.
 
 - [ ] **Step 4: Commit**
@@ -1387,9 +1422,25 @@ test-only.
     :ok = SourceSpool.finalize(spool)
     assert_receive {:res, {:ok, _img}}, 5_000
   end
+
+  # (7) source/1 after abort returns :aborted, synchronously (direct unit).
+  test "source/1 after abort returns :aborted" do
+    {:ok, spool} = SourceSpool.new(content_length: 10)
+    :ok = SourceSpool.abort(spool)
+    assert {:error, :aborted} = SourceSpool.source(spool)
+  end
+
+  # (8) Zero-length source: bounded EOF, decode errors rather than hanging.
+  @tag timeout: 10_000
+  test "zero-length source decodes to an error without hanging" do
+    {:ok, spool} = SourceSpool.new(content_length: 0)
+    :ok = SourceSpool.finalize(spool)
+    {:ok, source} = SourceSpool.source(spool)
+    assert {:error, _} = decode_source(source)
+  end
 ```
 
-- [ ] **Step 2: Add the watchdog test** to `test/vix/vips/image_test.exs` (inside the `new_from_enum seekable` describe):
+- [ ] **Step 2: Add the watchdog + timeout-validation tests** to `test/vix/vips/image_test.exs` (inside the `new_from_enum seekable` describe):
 
 ```elixir
     # (4) :timeout watchdog — the ONLY liveness mechanism for a live-but-stalled producer (the
@@ -1400,6 +1451,11 @@ test-only.
 
       assert {:error, _} =
                Image.new_from_enum(enum, seekable: true, content_length: 1000, timeout: 300)
+    end
+
+    test "seekable rejects an invalid :timeout before doing any work" do
+      assert {:error, :invalid_timeout} =
+               Image.new_from_enum([<<>>], seekable: true, content_length: 1, timeout: 0)
     end
 ```
 
