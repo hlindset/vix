@@ -655,10 +655,13 @@ on the Task 6 Image integration.
   alias Vix.Vips.Image
 
   # Decode a Vix.Vips.Source via the same internal path new_from_enum uses.
+  # NOTE: operation_call returns {:ok, {%Image{}, %{flags: ...}}} — the first element is ALREADY a
+  # wrapped %Vix.Vips.Image{} (production's wrap_type/1 is a no-op on it), so match the struct
+  # directly rather than re-wrapping a bare ref.
   defp decode_source(%Vix.Vips.Source{} = source) do
     with {:ok, loader} <- Vix.Vips.Foreign.find_load_source(source),
-         {:ok, {ref, _}} <- Vix.Vips.Operation.Helper.operation_call(loader, [source], []) do
-      {:ok, %Image{ref: ref}}
+         {:ok, {%Image{} = image, _}} <- Vix.Vips.Operation.Helper.operation_call(loader, [source], []) do
+      {:ok, image}
     end
   end
 ```
