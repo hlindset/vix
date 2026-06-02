@@ -802,6 +802,8 @@ ERL_NIF_TERM nif_source_spool_source(ErlNifEnv *env, int argc,
     return make_error(env, "invalid spool handle");
 
   SpoolBuf *b = wr->buf;
+  if (!b) /* mirror new/write/finalize/abort guards */
+    return make_error_term(env, make_atom(env, "aborted"));
 
   enif_mutex_lock(b->lock);
   if (b->state == SPOOL_ABORTED) {

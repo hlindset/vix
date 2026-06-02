@@ -696,6 +696,23 @@ defmodule Vix.Vips.Image do
 
   To see format-specific options, check [Operation](./search.html?q=load+-buffer+-filename+-profile) module.
 
+  ## Seekable input (`seekable: true`)
+
+  By default the enumerable is fed through a read-once OS pipe, which cannot seek —
+  seek-heavy formats (HEIF, AVIF, multi-page TIFF) may fail to decode. Passing
+  `seekable: true` instead spools the bytes into a native, seekable in-memory buffer
+  (`Vix.SourceSpool`) that libvips can seek over while the data is still arriving.
+
+  This mode **requires** `content_length:` (the exact total byte size — a stable length
+  is mandatory for a seekable source) and accepts:
+
+    * `max_bytes:` - reject a declared `content_length` above this cap (defaults to a
+      library policy cap; set it when `content_length` comes from an untrusted source).
+    * `timeout:` - milliseconds after which a stalled producer is aborted instead of
+      hanging the decode.
+
+      Image.new_from_enum(stream, seekable: true, content_length: byte_size)
+
   """
   @spec new_from_enum(Enumerable.t(), String.t() | keyword) :: {:ok, t()} | {:error, term()}
   def new_from_enum(enum, opts \\ []) do
