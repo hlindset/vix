@@ -699,6 +699,17 @@ defmodule Vix.Vips.Image do
   """
   @spec new_from_enum(Enumerable.t(), String.t() | keyword) :: {:ok, t()} | {:error, term()}
   def new_from_enum(enum, opts \\ []) do
+    # opts may be a binary (backward-compat suffix string) — only keyword opts
+    # can request seekable, so guard on is_list before touching Keyword.
+    if is_list(opts) and Keyword.get(opts, :seekable, false) do
+      {_seekable, opts} = Keyword.pop(opts, :seekable)
+      new_from_enum_spool(enum, opts)
+    else
+      new_from_enum_pipe(enum, opts)
+    end
+  end
+
+  defp new_from_enum_pipe(enum, opts) do
     parent = self()
 
     pid =
@@ -736,6 +747,68 @@ defmodule Vix.Vips.Image do
           {:ok, wrap_type(ref)}
         end
     end
+  end
+
+  defp new_from_enum_spool(enum, opts) do
+    {timeout, opts} = Keyword.pop(opts, :timeout)
+    {len, opts} = Keyword.pop(opts, :content_length)
+    {max, opts} = Keyword.pop(opts, :max_bytes, Vix.SourceSpool.default_max_bytes())
+
+    with :ok <- validate_spool_length(len, max),
+         :ok <- validate_timeout(timeout),
+         :ok <- validate_options(opts),
+         {:ok, spool, writer} <-
+           Vix.SourceSpool.start_feeder(enum, content_length: len, max_bytes: max) do
+      watchdog = if timeout, do: start_spool_watchdog(spool, writer, timeout)
+
+      try do
+        with {:ok, source} <- Vix.SourceSpool.source(spool),
+             {:ok, loader} <- Vix.Vips.Foreign.find_load_source(source),
+             {:ok, {ref, _}} <-
+               Vix.Vips.Operation.Helper.operation_call(loader, [source], opts) do
+          {:ok, wrap_type(ref)}
+        else
+          {:error, _} = err ->
+            Vix.SourceSpool.abort(spool)
+            err
+        end
+      catch
+        kind, reason ->
+          Vix.SourceSpool.abort(spool)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      after
+        if watchdog, do: send(watchdog, :done)
+      end
+    end
+  end
+
+  defp validate_spool_length(len, _max) when not is_integer(len),
+    do: {:error, :content_length_required}
+
+  defp validate_spool_length(len, _max) when len < 0,
+    do: {:error, :invalid_content_length}
+
+  defp validate_spool_length(len, max) when len > max,
+    do: {:error, :content_length_too_large}
+
+  defp validate_spool_length(_len, _max), do: :ok
+
+  defp validate_timeout(nil), do: :ok
+  defp validate_timeout(t) when is_integer(t) and t > 0, do: :ok
+  defp validate_timeout(_), do: {:error, :invalid_timeout}
+
+  # The watchdog both aborts the spool (wakes parked readers) AND kills the feeder.
+  # Abort alone wakes readers but leaves a live-but-stalled producer blocked in the enum.
+  defp start_spool_watchdog(spool, writer, timeout) do
+    spawn(fn ->
+      receive do
+        :done -> :ok
+      after
+        timeout ->
+          Vix.SourceSpool.abort(spool)
+          Process.exit(writer, :kill)
+      end
+    end)
   end
 
   @doc """

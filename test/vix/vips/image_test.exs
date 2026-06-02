@@ -531,4 +531,34 @@ defmodule Vix.Vips.ImageTest do
     # Test that copy_memory can be called multiple times
     assert {:ok, _memory_im2} = Image.copy_memory(memory_im)
   end
+
+  describe "new_from_enum seekable" do
+    defp chunked(path, size \\ 8192) do
+      bytes = File.read!(path)
+      chunks = for <<c::binary-size(size) <- bytes>>, do: c
+      used = length(chunks) * size
+      tail = binary_part(bytes, used, byte_size(bytes) - used)
+      {chunks ++ [tail], byte_size(bytes)}
+    end
+
+    for name <- ["puppies.jpg", "gradient.png", "boats.tif"] do
+      test "decodes #{name} identically to new_from_file" do
+        path = img_path(unquote(name))
+        {:ok, ref} = Image.new_from_file(path)
+        {enum, len} = chunked(path)
+
+        assert {:ok, img} =
+                 Image.new_from_enum(enum, seekable: true, content_length: len)
+
+        assert {Image.width(img), Image.height(img), Image.bands(img)} ==
+                 {Image.width(ref), Image.height(ref), Image.bands(ref)}
+      end
+    end
+
+    test "requires content_length when seekable" do
+      {enum, _len} = chunked(img_path("puppies.jpg"))
+      assert {:error, :content_length_required} =
+               Image.new_from_enum(enum, seekable: true)
+    end
+  end
 end
