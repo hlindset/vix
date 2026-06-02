@@ -66,7 +66,7 @@ defmodule Vix.SourceSpool do
   @spec status(t) :: status
   def status(%SourceSpool{ref: ref}), do: Nif.nif_source_spool_status(ref)
 
-  @spec start_feeder(Enumerable.t(), keyword) :: {:ok, t, pid} | {:error, term}
+  @spec start_feeder(Enumerable.t(), keyword) :: {:ok, t, pid, reference} | {:error, term}
   def start_feeder(enum, opts) do
     case Keyword.fetch(opts, :content_length) do
       :error -> {:error, :content_length_required}   # don't raise; match the rest of the API
@@ -90,9 +90,12 @@ defmodule Vix.SourceSpool do
       end)
 
     receive do
+      # Return the spawn-time monitor so the caller can observe the feeder's exit reason (e.g. a
+      # forwarded producer error). It is the caller's to `Process.demonitor(mon, [:flush])` when
+      # done — establishing it post-hoc would race a fast-failing feeder (Process.monitor on an
+      # already-dead pid yields :noproc, losing the reason).
       {^writer, {:ok, spool}} ->
-        Process.demonitor(mon, [:flush])
-        {:ok, spool, writer}
+        {:ok, spool, writer, mon}
 
       {^writer, {:error, _} = err} ->
         Process.demonitor(mon, [:flush])

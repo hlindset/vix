@@ -139,7 +139,7 @@ defmodule Vix.SourceSpoolTest do
       tail = binary_part(bytes, length(chunks) * 8192, byte_size(bytes) - length(chunks) * 8192)
       enum = chunks ++ [tail]
 
-      {:ok, spool, _writer} =
+      {:ok, spool, _writer, _mon} =
         SourceSpool.start_feeder(enum, content_length: byte_size(bytes))
 
       {:ok, source} = SourceSpool.source(spool)
@@ -160,7 +160,7 @@ defmodule Vix.SourceSpoolTest do
         fn _ -> :ok end
       )
 
-      {:ok, spool, _writer} =
+      {:ok, spool, _writer, _mon} =
         SourceSpool.start_feeder(enum, content_length: byte_size(bytes))
 
       {:ok, source} = SourceSpool.source(spool)
@@ -169,7 +169,7 @@ defmodule Vix.SourceSpoolTest do
 
     test "content_length: 0 finalizes without touching the enum" do
       enum = Stream.map([:boom], fn _ -> raise "must not be pulled" end)
-      assert {:ok, _spool, _writer} =
+      assert {:ok, _spool, _writer, _mon} =
                SourceSpool.start_feeder(enum, content_length: 0)
     end
   end
@@ -204,11 +204,20 @@ defmodule Vix.SourceSpoolTest do
   defp blocking_enum,
     do: Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
 
+  # Poll status/1 until terminal (a monitor-down transition is asynchronous).
+  defp wait_until_aborted(spool, tries \\ 200) do
+    case SourceSpool.status(spool) do
+      {:aborted, _} = s -> s
+      _ when tries > 0 -> Process.sleep(5); wait_until_aborted(spool, tries - 1)
+      other -> other
+    end
+  end
+
   # (1) The design's "single most important contract": start_feeder makes the FEEDER the
   # monitored writer. Killing the feeder (not the test process) must wake a parked reader.
   @tag timeout: 10_000
   test "start_feeder monitors the feeder: killing it wakes a parked reader" do
-    {:ok, spool, writer} =
+    {:ok, spool, writer, _mon} =
       SourceSpool.start_feeder(blocking_enum(), content_length: 1000)
 
     {:ok, source} = SourceSpool.source(spool)
@@ -225,7 +234,7 @@ defmodule Vix.SourceSpoolTest do
   @tag timeout: 10_000
   test "a feeder :kill does not crash the caller; the spool reports :aborted" do
     Process.flag(:trap_exit, true)
-    {:ok, spool, writer} = SourceSpool.start_feeder(blocking_enum(), content_length: 1000)
+    {:ok, spool, writer, _mon} = SourceSpool.start_feeder(blocking_enum(), content_length: 1000)
     Process.exit(writer, :kill)
     Process.sleep(50)
     assert {:error, :aborted} = SourceSpool.source(spool)  # caller still alive & usable
@@ -414,7 +423,6 @@ defmodule Vix.SourceSpoolTest do
 
     spool = receive do: ({:spool, s} -> s), after: (1_000 -> flunk("no spool"))
     Process.exit(writer, :kill)
-    Process.sleep(50)
-    assert {:aborted, :writer_down} == SourceSpool.status(spool)
+    assert {:aborted, :writer_down} == wait_until_aborted(spool)
   end
 end

@@ -795,15 +795,17 @@ defmodule Vix.Vips.Image do
     with :ok <- validate_spool_length(len, max),
          :ok <- validate_timeout(timeout),
          :ok <- validate_options(opts),
-         {:ok, spool, writer} <-
+         {:ok, spool, writer, mon} <-
            Vix.SourceSpool.start_feeder(enum, content_length: len, max_bytes: max) do
       # The watchdog stays armed until the FEEDER finishes (it monitors the feeder), NOT until the
       # loader returns. libvips images are lazy — pixels may be pulled from the source after
       # new_from_enum/2 returns — so a watchdog tied to the load call would leave lazy evaluation
       # unprotected. Tying it to the feeder's lifetime covers the whole danger window: once the
       # feeder finalizes (buffer complete) no read can stall, and the watchdog self-terminates.
+      #
+      # `mon` is start_feeder's spawn-time monitor — established before the feeder runs, so it
+      # reliably captures the exit reason even if the producer fails immediately.
       if timeout, do: start_spool_watchdog(spool, writer, timeout)
-      mon = Process.monitor(writer)
 
       try do
         with {:ok, source} <- Vix.SourceSpool.source(spool),
