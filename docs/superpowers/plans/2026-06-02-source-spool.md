@@ -556,6 +556,8 @@ ERL_NIF_TERM nif_source_spool_write(ErlNifEnv *env, int argc,
     return make_error(env, "failed to get binary");
 
   SpoolBuf *b = wr->buf;
+  if (!b) /* mirror finalize/abort guards */
+    return make_error_term(env, make_atom(env, "aborted"));
   size_t off = 0;
 
   while (off < bin.size) {
