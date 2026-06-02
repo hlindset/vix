@@ -142,7 +142,8 @@ defmodule Vix.SourceSpool do
     catch
       kind, reason ->
         abort(spool)
-        exit({:shutdown, {:producer_error, {kind, reason}}})
+        # Symmetric with the rescue branch: {cause, stacktrace}.
+        exit({:shutdown, {:producer_error, {{kind, reason}, __STACKTRACE__}}})
     end
   end
 
