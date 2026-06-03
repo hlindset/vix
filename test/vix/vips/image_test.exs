@@ -579,14 +579,14 @@ defmodule Vix.Vips.ImageTest do
     # (4) :timeout watchdog — the ONLY liveness mechanism for a live-but-stalled producer (the
     # monitor only fires on death). A stalled feeder must yield {:error,_}, not hang.
     @tag timeout: 10_000
-    test "seekable :timeout aborts a stalled feeder instead of hanging" do
+    test "mode: :spool :timeout aborts a stalled feeder instead of hanging" do
       enum = Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
 
       assert {:error, _} =
                Image.new_from_enum(enum, mode: :spool, content_length: 1000, timeout: 300)
     end
 
-    test "seekable rejects an invalid :timeout before doing any work" do
+    test "mode: :spool rejects an invalid :timeout before doing any work" do
       assert {:error, :invalid_timeout} =
                Image.new_from_enum([<<>>], mode: :spool, content_length: 1, timeout: 0)
     end
@@ -597,7 +597,7 @@ defmodule Vix.Vips.ImageTest do
     # lifetime, so it also covers reads triggered after new_from_enum/2 returns) must surface an
     # error within ~timeout rather than hang. The underlying read error is our ECANCELED abort.
     @tag timeout: 10_000
-    test "seekable :timeout aborts a producer that stalls mid-delivery" do
+    test "mode: :spool :timeout aborts a producer that stalls mid-delivery" do
       bytes = File.read!(img_path("boats.tif"))
       total = byte_size(bytes)
       half = binary_part(bytes, 0, div(total, 2))
@@ -620,7 +620,7 @@ defmodule Vix.Vips.ImageTest do
     # {:producer_error, _}, not the downstream libvips read error — so callers can diagnose the
     # real cause. A seek-heavy TIFF guarantees the decode actually needs the withheld bytes.
     @tag timeout: 10_000
-    test "seekable surfaces the producer's exception as the error reason" do
+    test "mode: :spool surfaces the producer's exception as the error reason" do
       bytes = File.read!(img_path("boats.tif"))
       total = byte_size(bytes)
       half = binary_part(bytes, 0, div(total, 2))
@@ -642,7 +642,7 @@ defmodule Vix.Vips.ImageTest do
     for name <- ["sample.heic", "sample.avif"] do
       @tag :heif
       @tag timeout: 10_000
-      test "decodes #{name} fed incrementally (seekable)" do
+      test "decodes #{name} fed incrementally (mode: :spool)" do
         path = img_path(unquote(name))
         # Clear opt-in failure if VIX_TEST_HEIF is set but the format isn't actually supported.
         case Vix.Vips.Foreign.find_load(path) do

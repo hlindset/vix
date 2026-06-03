@@ -696,37 +696,60 @@ defmodule Vix.Vips.Image do
 
   To see format-specific options, check [Operation](./search.html?q=load+-buffer+-filename+-profile) module.
 
-  ## Seekable input (`seekable: true`)
+  ## Source mode
 
-  By default the enumerable is fed through a read-once OS pipe, which cannot seek —
-  seek-heavy formats (HEIF, AVIF, multi-page TIFF) may fail to decode. Passing
-  `seekable: true` spools the bytes into a native, seekable in-memory buffer
-  (`Vix.SourceSpool`) that libvips can seek over while the data is still arriving.
+  The `mode:` option selects how the enumerable is presented to libvips:
 
-      Image.new_from_enum(stream, seekable: true, content_length: byte_size)
+  | `mode:` | with a valid `content_length` | without `content_length` |
+  | --- | --- | --- |
+  | `:pipe` *(default)* | streams (length ignored) | streams |
+  | `:spool` | seekable in-memory buffer, download/decode overlap | `{:error, :content_length_required}` |
+  | `:auto` | same as `:spool` | falls back to `:pipe` (logs at `debug`) |
 
-  Options:
+      # known length — overlap + seek (HEIF/AVIF/multi-page TIFF)
+      Image.new_from_enum(stream, mode: :spool, content_length: byte_size)
 
-    * `content_length:` (**required**) - the exact total byte size. A stable length is
-      mandatory for a seekable source, so this mode cannot be used with unknown-length input.
+      # length may be absent (e.g. chunked transfer encoding) — best effort
+      Image.new_from_enum(stream, mode: :auto, content_length: maybe_length)
+
+  - **`:pipe`** (default) feeds the bytes through a read-once OS pipe. Forward formats (JPEG, PNG)
+    decode as their bytes arrive (download/decode overlap — the same benefit `:spool` gives *forward*
+    formats); seek-heavy formats can't seek a pipe, so libvips buffers the whole stream
+    (`read_to_memory`) before decoding. `content_length:`, `max_bytes:`, and `timeout:` are
+    spool-only and ignored here.
+  - **`:spool`** spools the bytes into a native seekable buffer (`Vix.SourceSpool`) that libvips can
+    seek over while data is still arriving. Requires `content_length:`.
+  - **`:auto`** uses the spool when `content_length` is present and falls back to `:pipe` when it is
+    `nil`/absent — for origins that may not send a `Content-Length`. With no length, forward formats
+    still overlap download/decode; seek-heavy formats (TIFF, AVIF) are buffered whole first (no overlap).
+    The fallback logs at `Logger.debug` (an expected, opted-in outcome). To *guarantee* overlap, use
+    `:spool` (which errors on a missing length); to *detect* the fallback, check `content_length`
+    before calling. Note `content_length: 0` is a valid empty-body length (routes to the spool),
+    not "no length".
+
+  > The former `seekable:` boolean option is removed. A stray `seekable:` key is now an unknown option,
+  > silently ignored, so such a call defaults to `mode: :pipe`.
+
+  Options (apply to `:spool`, and `:auto` when a length is supplied):
+
+    * `content_length:` - exact total byte size. **Required** for `:spool`. A stable length is
+      mandatory for a seekable source.
     * `max_bytes:` - reject a declared `content_length` larger than this. **Defaults to 100 MB**
-      (override globally with `config :vix, source_spool_max_bytes: bytes`, or per call). Existing
-      callers streaming bodies larger than 100 MB must raise this when flipping on `seekable: true`,
-      otherwise they get `{:error, :content_length_too_large}`. Set it deliberately when
-      `content_length` comes from an untrusted source such as a `Content-Length` header.
-    * `timeout:` - maximum milliseconds for the producer to deliver the full body. The deadline
-      covers the producer's whole lifetime, including reads triggered by lazy decoding *after* this
-      function returns; on expiry the source is aborted and the producer killed, so any pending or
-      later decode fails with an error rather than hanging. Without it, a stalled producer can hang
-      the decode indefinitely.
+      (override globally with `config :vix, source_spool_max_bytes: bytes`, or per call). Set it
+      deliberately when `content_length` comes from an untrusted source such as a `Content-Length`
+      header, otherwise large bodies get `{:error, :content_length_too_large}`.
+    * `timeout:` - maximum milliseconds for the producer to deliver the full body. Covers the
+      producer's whole lifetime, including reads triggered by lazy decoding *after* this function
+      returns; on expiry the source is aborted and the producer killed, so any pending or later
+      decode fails rather than hanging.
 
-  The entire input is held in RAM (`~content_length` bytes) for the lifetime of the decode. If the
-  producer raises, the decode fails with an aborted/error result — not the original exception (the
-  producer runs in a separate process).
+  For `:spool` (and `:auto` with a length), the entire input is held in RAM (`~content_length`
+  bytes) for the lifetime of the decode. If the producer raises, the decode fails with the
+  producer's reason wrapped in `{:producer_error, _}` (the producer runs in a separate process).
 
-  ### Concurrency and resource limits
+  ### Concurrency and resource limits (spool path)
 
-  Each in-flight seekable decode holds `content_length` bytes resident **and** parks one dirty-IO
+  Each in-flight spool decode holds `content_length` bytes resident **and** parks one dirty-IO
   scheduler thread while it waits for bytes. Bound concurrency at the call site — Vix deliberately
   does not, because the right limit depends on your RAM budget (`N × content_length`), the dirty-IO
   scheduler pool (`+SDio`, default ~10), and libvips' own per-operation threads
