@@ -776,7 +776,7 @@ defmodule Vix.Vips.Image do
     case Keyword.get(opts, :content_length) do
       nil ->
         Logger.debug(fn ->
-          "Vix.Image.new_from_enum/2: mode: :auto with no content_length — " <>
+          "Vix.Vips.Image.new_from_enum/2: mode: :auto with no content_length — " <>
             "using streaming pipe (no seek-overlap)"
         end)
 
