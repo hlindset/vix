@@ -532,7 +532,7 @@ defmodule Vix.Vips.ImageTest do
     assert {:ok, _memory_im2} = Image.copy_memory(memory_im)
   end
 
-  describe "new_from_enum seekable" do
+  describe "new_from_enum mode" do
     defp chunked(path, size \\ 8192) do
       bytes = File.read!(path)
       chunks = for <<c::binary-size(size) <- bytes>>, do: c
@@ -549,17 +549,31 @@ defmodule Vix.Vips.ImageTest do
         {enum, len} = chunked(path)
 
         assert {:ok, img} =
-                 Image.new_from_enum(enum, seekable: true, content_length: len)
+                 Image.new_from_enum(enum, mode: :spool, content_length: len)
 
         assert {Image.width(img), Image.height(img), Image.bands(img)} ==
                  {Image.width(ref), Image.height(ref), Image.bands(ref)}
       end
     end
 
-    test "requires content_length when seekable" do
+    test "requires content_length for mode: :spool" do
       {enum, _len} = chunked(img_path("puppies.jpg"))
       assert {:error, :content_length_required} =
-               Image.new_from_enum(enum, seekable: true)
+               Image.new_from_enum(enum, mode: :spool)
+    end
+
+    test "unknown mode returns an error tuple" do
+      {enum, len} = chunked(img_path("puppies.jpg"))
+
+      assert {:error, {:invalid_mode, :bogus}} =
+               Image.new_from_enum(enum, mode: :bogus, content_length: len)
+    end
+
+    test "mode: :pipe ignores spool-only opts and still decodes" do
+      {enum, len} = chunked(img_path("puppies.jpg"))
+
+      assert {:ok, _img} =
+               Image.new_from_enum(enum, mode: :pipe, content_length: len, max_bytes: 1, timeout: 5)
     end
 
     # (4) :timeout watchdog — the ONLY liveness mechanism for a live-but-stalled producer (the
@@ -569,12 +583,12 @@ defmodule Vix.Vips.ImageTest do
       enum = Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
 
       assert {:error, _} =
-               Image.new_from_enum(enum, seekable: true, content_length: 1000, timeout: 300)
+               Image.new_from_enum(enum, mode: :spool, content_length: 1000, timeout: 300)
     end
 
     test "seekable rejects an invalid :timeout before doing any work" do
       assert {:error, :invalid_timeout} =
-               Image.new_from_enum([<<>>], seekable: true, content_length: 1, timeout: 0)
+               Image.new_from_enum([<<>>], mode: :spool, content_length: 1, timeout: 0)
     end
 
     # :timeout aborts a producer that stalls AFTER partial delivery — not only one that delivers
@@ -599,7 +613,7 @@ defmodule Vix.Vips.ImageTest do
         )
 
       assert {:error, _} =
-               Image.new_from_enum(enum, seekable: true, content_length: total, timeout: 300)
+               Image.new_from_enum(enum, mode: :spool, content_length: total, timeout: 300)
     end
 
     # When the producer (enumerable) raises, the decode fails with the producer's reason wrapped in
@@ -622,7 +636,7 @@ defmodule Vix.Vips.ImageTest do
         )
 
       assert {:error, {:producer_error, {%RuntimeError{message: "upstream exploded"}, _stack}}} =
-               Image.new_from_enum(enum, seekable: true, content_length: total)
+               Image.new_from_enum(enum, mode: :spool, content_length: total)
     end
 
     for name <- ["sample.heic", "sample.avif"] do
@@ -640,7 +654,7 @@ defmodule Vix.Vips.ImageTest do
         {enum, len} = chunked(path)
 
         assert {:ok, img} =
-                 Image.new_from_enum(enum, seekable: true, content_length: len)
+                 Image.new_from_enum(enum, mode: :spool, content_length: len)
 
         assert {Image.width(img), Image.height(img)} ==
                  {Image.width(ref), Image.height(ref)}

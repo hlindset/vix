@@ -737,15 +737,23 @@ defmodule Vix.Vips.Image do
   """
   @spec new_from_enum(Enumerable.t(), String.t() | keyword) :: {:ok, t()} | {:error, term()}
   def new_from_enum(enum, opts \\ []) do
-    # opts may be a binary (backward-compat suffix string) — only keyword opts
-    # can request seekable, so guard on is_list before touching Keyword.
-    if is_list(opts) and Keyword.get(opts, :seekable, false) do
-      {_seekable, opts} = Keyword.pop(opts, :seekable)
-      new_from_enum_spool(enum, opts)
+    # opts may be a binary (backward-compat suffix string); only keyword opts select a mode.
+    if is_list(opts) do
+      {mode, opts} = Keyword.pop(opts, :mode, :pipe)
+      dispatch_enum(mode, enum, opts)
     else
       new_from_enum_pipe(enum, opts)
     end
   end
+
+  defp dispatch_enum(:pipe, enum, opts), do: new_from_enum_pipe(enum, drop_spool_opts(opts))
+  defp dispatch_enum(:spool, enum, opts), do: new_from_enum_spool(enum, opts)
+  defp dispatch_enum(other, _enum, _opts), do: {:error, {:invalid_mode, other}}
+
+  # Spool-only opts must not leak to the loader on the pipe path. Hygiene, not strictly required
+  # (validate_options/1 only checks Keyword.keyword? and operation_call skips unknown keys), but it
+  # avoids a stray content_length: colliding with a real loader option of the same name.
+  defp drop_spool_opts(opts), do: Keyword.drop(opts, [:content_length, :max_bytes, :timeout])
 
   defp new_from_enum_pipe(enum, opts) do
     parent = self()
