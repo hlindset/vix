@@ -3,8 +3,8 @@ defmodule Vix.SourceSpool do
   A seekable, concurrent libvips source backed by a pre-allocated in-memory
   buffer fed from Elixir while libvips decodes.
 
-  Prefer `start_feeder/2`: it starts a feeder process that owns writes/finalization
-  and returns a spool handle for `source/1` and `abort/1`. The feeder stays the
+  Prefer `start_producer/2`: it starts a producer process that owns writes/finalization
+  and returns a spool handle for `source/1` and `abort/1`. The producer stays the
   writer — the caller must not `write/2`/`finalize/1`. `new/1`, `write/2`, and
   `finalize/1` are low-level: the process that calls `new/1` becomes the only
   process allowed to `write/2`/`finalize/1`, and its death aborts the spool.
@@ -53,10 +53,11 @@ defmodule Vix.SourceSpool do
 
     * `:overflow` - a write exceeded `content_length`
     * `:short` - finalized before reaching `content_length`
-    * `:cancelled` - explicit `abort/1` (incl. the feeder aborting on a producer error)
+    * `:cancelled` - explicit `abort/1` (incl. the producer aborting on an enum error)
     * `:writer_down` - the writer process died before finalizing
   """
-  @type status :: :open | :done | {:aborted, :overflow | :short | :cancelled | :writer_down | :error}
+  @type status ::
+          :open | :done | {:aborted, :overflow | :short | :cancelled | :writer_down | :error}
 
   @doc """
   Returns the spool's current state — `:open`, `:done`, or `{:aborted, reason}`.
@@ -66,23 +67,24 @@ defmodule Vix.SourceSpool do
   @spec status(t) :: status
   def status(%SourceSpool{ref: ref}), do: Nif.nif_source_spool_status(ref)
 
-  @spec start_feeder(Enumerable.t(), keyword) :: {:ok, t, pid, reference} | {:error, term}
-  def start_feeder(enum, opts) do
+  @spec start_producer(Enumerable.t(), keyword) :: {:ok, t, pid, reference} | {:error, term}
+  def start_producer(enum, opts) do
     case Keyword.fetch(opts, :content_length) do
-      :error -> {:error, :content_length_required}   # don't raise; match the rest of the API
-      {:ok, len} -> do_start_feeder(enum, opts, len)
+      # don't raise; match the rest of the API
+      :error -> {:error, :content_length_required}
+      {:ok, len} -> do_start_producer(enum, opts, len)
     end
   end
 
-  defp do_start_feeder(enum, opts, len) do
+  defp do_start_producer(enum, opts, len) do
     parent = self()
 
-    {writer, mon} =
+    {producer, mon} =
       spawn_monitor(fn ->
         case new(opts) do
           {:ok, spool} ->
             send(parent, {self(), {:ok, spool}})
-            feed_spool(enum, spool, len)
+            produce(enum, spool, len)
 
           {:error, _} = err ->
             send(parent, {self(), err})
@@ -90,40 +92,45 @@ defmodule Vix.SourceSpool do
       end)
 
     receive do
-      # Return the spawn-time monitor so the caller can observe the feeder's exit reason (e.g. a
+      # Return the spawn-time monitor so the caller can observe the producer's exit reason (e.g. a
       # forwarded producer error). It is the caller's to `Process.demonitor(mon, [:flush])` when
-      # done — establishing it post-hoc would race a fast-failing feeder (Process.monitor on an
+      # done — establishing it post-hoc would race a fast-failing producer (Process.monitor on an
       # already-dead pid yields :noproc, losing the reason).
-      {^writer, {:ok, spool}} ->
-        {:ok, spool, writer, mon}
+      {^producer, {:ok, spool}} ->
+        {:ok, spool, producer, mon}
 
-      {^writer, {:error, _} = err} ->
+      {^producer, {:error, _} = err} ->
         Process.demonitor(mon, [:flush])
         err
 
-      {:DOWN, ^mon, :process, ^writer, reason} ->
+      {:DOWN, ^mon, :process, ^producer, reason} ->
         {:error, reason}
     end
   end
 
   # Zero-length: finalize WITHOUT pulling the enum (a blocking empty stream
   # would otherwise deadlock readers at EOF).
-  defp feed_spool(_enum, spool, 0), do: finalize(spool)
+  defp produce(_enum, spool, 0), do: finalize(spool)
 
-  defp feed_spool(enum, spool, len) when len > 0 do
+  defp produce(enum, spool, len) when len > 0 do
     try do
       enum
       |> Enum.reduce_while(0, fn iodata, written ->
         case IO.iodata_to_binary(iodata) do
           "" ->
-            {:cont, written}   # skip empty chunks (no-op write; avoids pathological spins)
+            # skip empty chunks (no-op write; avoids pathological spins)
+            {:cont, written}
 
           bin ->
             case write(spool, bin) do
               :ok ->
                 case written + byte_size(bin) do
-                  ^len -> finalize(spool); {:halt, :filled}
-                  n -> {:cont, n}
+                  ^len ->
+                    finalize(spool)
+                    {:halt, :filled}
+
+                  n ->
+                    {:cont, n}
                 end
 
               {:error, _} ->
@@ -134,12 +141,13 @@ defmodule Vix.SourceSpool do
       |> case do
         :filled -> :ok
         :stopped -> :ok
-        n when is_integer(n) -> finalize(spool)  # enum ended early -> {:error, :short}
+        # enum ended early -> {:error, :short}
+        n when is_integer(n) -> finalize(spool)
       end
     rescue
       e ->
         # Abort wakes any parked reader (decode fails); exit carries the producer's reason so a
-        # consumer monitoring the feeder can surface it. {:shutdown, _} avoids a crash report.
+        # consumer monitoring the producer can surface it. {:shutdown, _} avoids a crash report.
         abort(spool)
         exit({:shutdown, {:producer_error, {e, __STACKTRACE__}}})
     catch

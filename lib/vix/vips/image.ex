@@ -844,17 +844,17 @@ defmodule Vix.Vips.Image do
     with :ok <- validate_spool_length(len, max),
          :ok <- validate_timeout(timeout),
          :ok <- validate_options(opts),
-         {:ok, spool, writer, mon} <-
-           Vix.SourceSpool.start_feeder(enum, content_length: len, max_bytes: max) do
-      # The watchdog stays armed until the FEEDER finishes (it monitors the feeder), NOT until the
+         {:ok, spool, producer, mon} <-
+           Vix.SourceSpool.start_producer(enum, content_length: len, max_bytes: max) do
+      # The watchdog stays armed until the producer finishes (it monitors the producer), NOT until the
       # loader returns. libvips images are lazy — pixels may be pulled from the source after
       # new_from_enum/2 returns — so a watchdog tied to the load call would leave lazy evaluation
-      # unprotected. Tying it to the feeder's lifetime covers the whole danger window: once the
-      # feeder finalizes (buffer complete) no read can stall, and the watchdog self-terminates.
+      # unprotected. Tying it to the producer's lifetime covers the whole danger window: once the
+      # producer finalizes (buffer complete) no read can stall, and the watchdog self-terminates.
       #
-      # `mon` is start_feeder's spawn-time monitor — established before the feeder runs, so it
+      # `mon` is start_producer's spawn-time monitor — established before the producer runs, so it
       # reliably captures the exit reason even if the producer fails immediately.
-      if timeout, do: start_spool_watchdog(spool, writer, timeout)
+      if timeout, do: start_spool_watchdog(spool, producer, timeout)
 
       try do
         with {:ok, source} <- Vix.SourceSpool.source(spool),
@@ -866,7 +866,7 @@ defmodule Vix.Vips.Image do
           {:error, _} = err ->
             Vix.SourceSpool.abort(spool)
             # If the producer raised, surface its reason instead of the generic decode error.
-            spool_producer_error(mon, writer) || err
+            spool_producer_error(mon, producer) || err
         end
       catch
         kind, reason ->
@@ -878,15 +878,15 @@ defmodule Vix.Vips.Image do
     end
   end
 
-  # The feeder exits with {:shutdown, {:producer_error, reason}} if the enumerable raised. On a
+  # The producer exits with {:shutdown, {:producer_error, reason}} if the enumerable raised. On a
   # decode failure, check for that exit so the caller sees the real producer reason rather than the
   # downstream libvips error. Other exits (:normal, :killed by the watchdog) fall back to `err`.
-  defp spool_producer_error(mon, writer) do
+  defp spool_producer_error(mon, producer) do
     receive do
-      {:DOWN, ^mon, :process, ^writer, {:shutdown, {:producer_error, reason}}} ->
+      {:DOWN, ^mon, :process, ^producer, {:shutdown, {:producer_error, reason}}} ->
         {:error, {:producer_error, reason}}
 
-      {:DOWN, ^mon, :process, ^writer, _other} ->
+      {:DOWN, ^mon, :process, ^producer, _other} ->
         nil
     after
       200 -> nil
@@ -908,22 +908,22 @@ defmodule Vix.Vips.Image do
   defp validate_timeout(t) when is_integer(t) and t > 0, do: :ok
   defp validate_timeout(_), do: {:error, :invalid_timeout}
 
-  # The watchdog both aborts the spool (wakes parked readers) AND kills the feeder.
+  # The watchdog both aborts the spool (wakes parked readers) AND kills the producer.
   # Abort alone wakes readers but leaves a live-but-stalled producer blocked in the enum.
-  # Bounds the total time the producer (feeder) has to deliver `content_length` bytes. Monitoring
-  # the feeder means the timer covers the full producer lifetime — including any lazy pixel reads
-  # after new_from_enum/2 returns — and self-terminates the instant the feeder finishes.
-  defp start_spool_watchdog(spool, writer, timeout) do
+  # Bounds the total time the producer (producer) has to deliver `content_length` bytes. Monitoring
+  # the producer means the timer covers the full producer lifetime — including any lazy pixel reads
+  # after new_from_enum/2 returns — and self-terminates the instant the producer finishes.
+  defp start_spool_watchdog(spool, producer, timeout) do
     spawn(fn ->
-      ref = Process.monitor(writer)
+      ref = Process.monitor(producer)
 
       receive do
-        # Feeder finalized/aborted and exited — the buffer is settled, no read can stall.
-        {:DOWN, ^ref, :process, ^writer, _reason} -> :ok
+        # Producer finalized/aborted and exited — the buffer is settled, no read can stall.
+        {:DOWN, ^ref, :process, ^producer, _reason} -> :ok
       after
         timeout ->
           Vix.SourceSpool.abort(spool)
-          Process.exit(writer, :kill)
+          Process.exit(producer, :kill)
       end
     end)
   end

@@ -90,13 +90,16 @@ defmodule Vix.SourceSpoolTest do
 
     # Decode in a separate process; it will block reading past `first`.
     parent = self()
-    decoder = spawn_link(fn ->
-      {:ok, img} = decode_source(source)
-      send(parent, {:decoded, Image.width(img), Image.height(img)})
-    end)
+
+    decoder =
+      spawn_link(fn ->
+        {:ok, img} = decode_source(source)
+        send(parent, {:decoded, Image.width(img), Image.height(img)})
+      end)
 
     :ok = SourceSpool.write(spool, first)
-    refute_received {:decoded, _, _}          # still blocked at the frontier
+    # still blocked at the frontier
+    refute_received {:decoded, _, _}
     :ok = SourceSpool.write(spool, rest)
     :ok = SourceSpool.finalize(spool)
 
@@ -111,36 +114,46 @@ defmodule Vix.SourceSpoolTest do
 
     parent = self()
     # The writer process owns the spool; it sends the source out, then parks.
-    writer = spawn(fn ->
-      {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
-      {:ok, source} = SourceSpool.source(spool)
-      send(parent, {:source, source})
-      Process.sleep(:infinity)   # never writes; dies on kill below
-    end)
+    writer =
+      spawn(fn ->
+        {:ok, spool} = SourceSpool.new(content_length: byte_size(bytes))
+        {:ok, source} = SourceSpool.source(spool)
+        send(parent, {:source, source})
+        # never writes; dies on kill below
+        Process.sleep(:infinity)
+      end)
 
-    source = receive do {:source, s} -> s after 1_000 -> flunk("no source") end
+    source =
+      receive do
+        {:source, s} -> s
+      after
+        1_000 -> flunk("no source")
+      end
 
-    decoder = spawn_link(fn ->
-      result = decode_source(source)
-      send(parent, {:decode_result, result})
-    end)
+    decoder =
+      spawn_link(fn ->
+        result = decode_source(source)
+        send(parent, {:decode_result, result})
+      end)
 
-    Process.sleep(50)            # let the decoder park at the frontier
-    Process.exit(writer, :kill)  # monitor-down -> ABORTED -> reader wakes
+    # let the decoder park at the frontier
+    Process.sleep(50)
+    # monitor-down -> ABORTED -> reader wakes
+    Process.exit(writer, :kill)
 
     assert_receive {:decode_result, {:error, _}}, 5_000
     _ = decoder
   end
 
-  describe "start_feeder/2" do
+  describe "start_producer/2" do
     test "feeds an enum and decodes" do
       bytes = File.read!(img_path("puppies.jpg"))
       chunks = for <<c::binary-size(8192) <- bytes>>, do: c
       tail = binary_part(bytes, length(chunks) * 8192, byte_size(bytes) - length(chunks) * 8192)
       enum = chunks ++ [tail]
 
-      {:ok, spool, _writer, _mon} =
-        SourceSpool.start_feeder(enum, content_length: byte_size(bytes))
+      {:ok, spool, _producer, _mon} =
+        SourceSpool.start_producer(enum, content_length: byte_size(bytes))
 
       {:ok, source} = SourceSpool.source(spool)
       {:ok, img} = decode_source(source)
@@ -151,17 +164,19 @@ defmodule Vix.SourceSpoolTest do
     test "finalizes at exactly content_length without pulling an extra (blocking) item" do
       bytes = File.read!(img_path("puppies.jpg"))
       # An enum that yields the whole body, then BLOCKS forever if pulled again.
-      enum = Stream.resource(
-        fn -> :first end,
-        fn
-          :first -> {[bytes], :done}
-          :done -> Process.sleep(:infinity)  # must never be reached
-        end,
-        fn _ -> :ok end
-      )
+      enum =
+        Stream.resource(
+          fn -> :first end,
+          fn
+            :first -> {[bytes], :done}
+            # must never be reached
+            :done -> Process.sleep(:infinity)
+          end,
+          fn _ -> :ok end
+        )
 
-      {:ok, spool, _writer, _mon} =
-        SourceSpool.start_feeder(enum, content_length: byte_size(bytes))
+      {:ok, spool, _producer, _mon} =
+        SourceSpool.start_producer(enum, content_length: byte_size(bytes))
 
       {:ok, source} = SourceSpool.source(spool)
       assert {:ok, _img} = decode_source(source)
@@ -169,8 +184,9 @@ defmodule Vix.SourceSpoolTest do
 
     test "content_length: 0 finalizes without touching the enum" do
       enum = Stream.map([:boom], fn _ -> raise "must not be pulled" end)
-      assert {:ok, _spool, _writer, _mon} =
-               SourceSpool.start_feeder(enum, content_length: 0)
+
+      assert {:ok, _spool, _producer, _mon} =
+               SourceSpool.start_producer(enum, content_length: 0)
     end
   end
 
@@ -207,37 +223,49 @@ defmodule Vix.SourceSpoolTest do
   # Poll status/1 until terminal (a monitor-down transition is asynchronous).
   defp wait_until_aborted(spool, tries \\ 200) do
     case SourceSpool.status(spool) do
-      {:aborted, _} = s -> s
-      _ when tries > 0 -> Process.sleep(5); wait_until_aborted(spool, tries - 1)
-      other -> other
+      {:aborted, _} = s ->
+        s
+
+      _ when tries > 0 ->
+        Process.sleep(5)
+        wait_until_aborted(spool, tries - 1)
+
+      other ->
+        other
     end
   end
 
-  # (1) The design's "single most important contract": start_feeder makes the FEEDER the
-  # monitored writer. Killing the feeder (not the test process) must wake a parked reader.
+  # (1) The design's "single most important contract": start_producer makes the producer the
+  # monitored writer. Killing the producer (not the test process) must wake a parked reader.
   @tag timeout: 10_000
-  test "start_feeder monitors the feeder: killing it wakes a parked reader" do
-    {:ok, spool, writer, _mon} =
-      SourceSpool.start_feeder(blocking_enum(), content_length: 1000)
+  test "start_producer monitors the producer: killing it wakes a parked reader" do
+    {:ok, spool, producer, _mon} =
+      SourceSpool.start_producer(blocking_enum(), content_length: 1000)
 
     {:ok, source} = SourceSpool.source(spool)
     parent = self()
     _decoder = spawn_link(fn -> send(parent, {:res, decode_source(source)}) end)
 
-    Process.sleep(50)            # decoder parks at the frontier (nothing written yet)
-    Process.exit(writer, :kill)  # feeder is the monitored writer
+    # decoder parks at the frontier (nothing written yet)
+    Process.sleep(50)
+    # producer is the monitored writer
+    Process.exit(producer, :kill)
     assert_receive {:res, {:error, _}}, 5_000
   end
 
-  # (2) The spawn_monitor payoff: a feeder :kill surfaces as an API error, never crashes the
+  # (2) The spawn_monitor payoff: a producer :kill surfaces as an API error, never crashes the
   # caller — even when the caller traps exits.
   @tag timeout: 10_000
-  test "a feeder :kill does not crash the caller; the spool reports :aborted" do
+  test "a producer :kill does not crash the caller; the spool reports :aborted" do
     Process.flag(:trap_exit, true)
-    {:ok, spool, writer, _mon} = SourceSpool.start_feeder(blocking_enum(), content_length: 1000)
-    Process.exit(writer, :kill)
+
+    {:ok, spool, producer, _mon} =
+      SourceSpool.start_producer(blocking_enum(), content_length: 1000)
+
+    Process.exit(producer, :kill)
     Process.sleep(50)
-    assert {:error, :aborted} = SourceSpool.source(spool)  # caller still alive & usable
+    # caller still alive & usable
+    assert {:error, :aborted} = SourceSpool.source(spool)
   after
     Process.flag(:trap_exit, false)
   end

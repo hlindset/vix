@@ -558,6 +558,7 @@ defmodule Vix.Vips.ImageTest do
 
     test "requires content_length for mode: :spool" do
       {enum, _len} = chunked(img_path("puppies.jpg"))
+
       assert {:error, :content_length_required} =
                Image.new_from_enum(enum, mode: :spool)
     end
@@ -573,13 +574,18 @@ defmodule Vix.Vips.ImageTest do
       {enum, len} = chunked(img_path("puppies.jpg"))
 
       assert {:ok, _img} =
-               Image.new_from_enum(enum, mode: :pipe, content_length: len, max_bytes: 1, timeout: 5)
+               Image.new_from_enum(enum,
+                 mode: :pipe,
+                 content_length: len,
+                 max_bytes: 1,
+                 timeout: 5
+               )
     end
 
     # (4) :timeout watchdog — the ONLY liveness mechanism for a live-but-stalled producer (the
-    # monitor only fires on death). A stalled feeder must yield {:error,_}, not hang.
+    # monitor only fires on death). A stalled producer must yield {:error,_}, not hang.
     @tag timeout: 10_000
-    test "mode: :spool :timeout aborts a stalled feeder instead of hanging" do
+    test "mode: :spool :timeout aborts a stalled producer instead of hanging" do
       enum = Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
 
       assert {:error, _} =
@@ -593,7 +599,7 @@ defmodule Vix.Vips.ImageTest do
 
     # :timeout aborts a producer that stalls AFTER partial delivery — not only one that delivers
     # nothing. A seek-heavy TIFF keeps its directory/strips at high offsets, so the loader blocks
-    # reading a position past the frontier that never arrives. The watchdog (tied to the feeder's
+    # reading a position past the frontier that never arrives. The watchdog (tied to the producer's
     # lifetime, so it also covers reads triggered after new_from_enum/2 returns) must surface an
     # error within ~timeout rather than hang. The underlying read error is our ECANCELED abort.
     @tag timeout: 10_000
@@ -663,7 +669,7 @@ defmodule Vix.Vips.ImageTest do
 
     # :auto WITH a length must use the spool — proven by the 300ms timeout watchdog, which ONLY the
     # spool path has. Routing matters: a stalled infinite stream errors fast on the spool (watchdog),
-    # but on the pipe path it HANGS (the pipe feeder blocks on the first never-arriving chunk) until
+    # but on the pipe path it HANGS (the pipe producer blocks on the first never-arriving chunk) until
     # the 10s ExUnit tag. Asserting the error arrives FAST (< 2s) distinguishes them — a regression
     # that routed :auto+length to the pipe would fail by timeout instead of passing for free.
     @tag timeout: 10_000
