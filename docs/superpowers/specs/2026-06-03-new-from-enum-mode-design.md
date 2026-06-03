@@ -41,7 +41,7 @@ outright** — no deprecation shim, no external migration. Internal tests and do
 
 ## Semantics
 
-| `mode:` | `content_length` valid (positive int ≤ `max_bytes`) | nil / absent | invalid (negative / > `max_bytes`) |
+| `mode:` | `content_length` valid (non-negative int ≤ `max_bytes`) | nil / absent | invalid (negative / > `max_bytes`) |
 |---|---|---|---|
 | **`:pipe`** *(default)* | ignored → pipe | pipe | ignored → pipe |
 | **`:spool`** | spool (overlap + seek) | `{:error, :content_length_required}` | `{:error, …}` |
@@ -50,11 +50,19 @@ outright** — no deprecation shim, no external migration. Internal tests and do
 Design constraints captured by the table:
 
 - **Default is `:pipe`.** Bare `new_from_enum(enum)` is byte-for-byte the current behavior.
-- **`:auto` only softens the *missing-length* case.** A negative or over-`max_bytes` length still
-  errors under `:auto`, identical to `:spool`. This preserves the `max_bytes` safety cap and
-  surfaces genuine caller bugs — `:auto` is "use a length if I have a good one," not "swallow
-  anything."
-- **`:pipe` + a `content_length` is silently ignored** (the caller explicitly chose pipe). No error.
+- **`:auto` degrades to pipe *only* when `content_length` is `nil` or absent.** Presence is the
+  switch: any value that is *present* — including a negative, over-`max_bytes`, or non-integer one —
+  is routed to the spool path's validation and errors there, identical to `:spool`. This preserves
+  the `max_bytes` safety cap and surfaces genuine caller bugs. `:auto` means "use a length if I have
+  one," not "swallow anything"; it does **not** sniff malformed values back to the pipe.
+- **`content_length: 0` is a valid (empty-body) length, not "no length."** It is non-`nil`, so under
+  `:auto`/`:spool` it routes to the spool, which already handles zero-length bodies deliberately
+  (`feed_spool/3` finalizes without pulling the enum). Decoding a zero-byte source then fails as a
+  normal "no image" decode error — the correct outcome for an empty body. It does **not** fall back
+  to the pipe.
+- **`:pipe` + a `content_length` is silently ignored** (the caller explicitly chose pipe). Likewise
+  `max_bytes:`/`timeout:` are spool-only and ignored under `:pipe` (and under `:auto` when it takes
+  the pipe branch) — these keys are dropped before the loader sees them. No error.
 
 ## Why pipe-delegation is the `:auto` fallback
 
@@ -127,8 +135,10 @@ defp drop_spool_opts(opts), do: Keyword.drop(opts, [:content_length, :max_bytes,
 
 Notes:
 
-- `:pipe` also runs `drop_spool_opts/1` so a stray `content_length:` (ignored per the table) cannot
-  reach `validate_options/1` or the loader.
+- `:pipe` also runs `drop_spool_opts/1` as hygiene, not hard necessity: `validate_options/1` only
+  checks `Keyword.keyword?` and `operation_call` silently skips keys the loader doesn't recognize,
+  so leftover spool opts are harmless today. Dropping them avoids a stray `content_length:`
+  colliding with a real loader option of the same name and keeps the loader's option set clean.
 - `:auto`-with-length routes to `new_from_enum_spool/2` unchanged; its existing `validate_spool_length/2`
   produces `:content_length_required` / `:invalid_content_length` / `:content_length_too_large`. Note
   `:content_length_required` is unreachable from `:auto` (nil is handled before the spool call), but
@@ -142,22 +152,41 @@ Notes:
 - `:spool` with no length → `{:error, :content_length_required}` (unchanged).
 - `:auto` / `:spool` with negative length → `{:error, :invalid_content_length}`.
 - `:auto` / `:spool` with length > `max_bytes` → `{:error, :content_length_too_large}`.
-- Unknown mode → `{:error, {:invalid_mode, value}}`.
+- `:auto` / `:spool` with `content_length: 0` → spool path; decodes the empty body and fails as a
+  normal decode error (not a validation error, not a pipe fallback).
+- Unknown mode → `{:error, {:invalid_mode, value}}`. This intentionally carries the offending value
+  (diverging from the bare-atom errors above) since a bad mode is a static caller mistake worth
+  echoing back; it stays an error tuple rather than raising, to keep the `{:ok, _} | {:error, _}`
+  contract uniform.
 - `:auto`→pipe and `:pipe` decode failures propagate the pipe path's existing error tuples.
 
 ## Testing
 
-`test/vix/vips/image_test.exs` (extend existing seekable coverage, renamed to `mode:`):
+`test/vix/vips/image_test.exs` (extend existing seekable coverage, retargeted to `mode:`):
 
 - `mode: :spool` + `content_length` → decodes (existing spool assertions, retargeted from
   `seekable: true`).
 - `mode: :spool` + no length → `{:error, :content_length_required}`.
-- `mode: :auto` + `content_length` → uses spool (decodes; same assertions as `:spool`).
-- `mode: :auto` + no length → uses pipe; decodes TIFF and AVIF and JPEG correctly and does **not**
-  error. `ExUnit.CaptureLog` asserts the `Logger.debug` fallback line fires.
+- `mode: :auto` + `content_length` → **must prove the spool path by behavior, not just "it decodes."**
+  A plain decode of a fully-fed enum is indistinguishable from the pipe, so a routing regression
+  (`:auto`+length silently going to the pipe) would pass green. Distinguish spool from pipe in at
+  least one test: either mirror the overlap test in `source_spool_test.exs` (park a decoder before
+  the body is fully written, assert it unblocks on later writes), or pass `timeout:` (honored only by
+  the spool) and assert the watchdog fires.
+- `mode: :auto` + no length → uses pipe; decodes JPEG, TIFF, and AVIF correctly and does **not**
+  error. Assert the fallback log with
+  `ExUnit.CaptureLog.capture_log([level: :debug], fn -> ... end)` — without forcing the level the
+  capture is vacuous (debug is below the default level) and the assertion would pass for the wrong
+  reason.
 - `mode: :auto` + length > `max_bytes` → still `{:error, :content_length_too_large}` (cap respected).
-- `mode: :pipe` + `content_length` → decodes via pipe, length ignored (no error).
+- `mode: :auto` + `content_length: 0` → routes to spool; assert the empty-body decode-error result
+  (pins the "0 is a length, not a fallback trigger" decision).
+- `mode: :pipe` + `content_length:` / `max_bytes:` / `timeout:` → decodes via pipe with the spool
+  opts ignored (guards `drop_spool_opts/1`; otherwise nothing tests the pipe branch against a leaked
+  spool opt).
 - Unknown `mode:` → `{:error, {:invalid_mode, _}}`.
+- Binary-suffix backward-compat: `new_from_enum(enum, "[shrink=2]")` (non-list opts) still routes to
+  the pipe — guards the new `is_list/1` dispatch from regressing the documented suffix-string API.
 - Default (no `mode:`) → pipe, unchanged behavior.
 
 Reuse the existing fixtures (`puppies.jpg`, `boats.tif`, `sample.avif`); HEIF stays env-gated behind
@@ -165,15 +194,35 @@ Reuse the existing fixtures (`puppies.jpg`, `boats.tif`, `sample.avif`); HEIF st
 
 ## Documentation
 
-Rewrite the `## Seekable input` `@doc` section in `new_from_enum/2`:
+Rewrite the `@doc` streaming section in `new_from_enum/2` (retitle the `## Seekable input` heading to
+`## Source mode`):
 
 - Document `mode:` with the three values and the semantics table.
-- Keep the `content_length:` / `max_bytes:` / `timeout:` option docs (apply to `:spool` and
-  `:auto`-with-length).
-- Add a one-line caveat under `:auto`: seek-heavy formats without a length fall back to
-  `read_to_memory` (no download/decode overlap).
+- Keep the `content_length:` / `max_bytes:` / `timeout:` option docs, noting they apply to `:spool`
+  and `:auto`-with-length and are **ignored under `:pipe`** (and under `:auto` when it takes the pipe
+  branch).
+- Caveat under `:auto`, stated precisely so it is not misread as "no overlap": *with no length,
+  forward formats (JPEG/PNG) still stream with overlap through the pipe; seek-heavy formats
+  (TIFF/AVIF) are `read_to_memory`'d by libvips first (no overlap).*
+- **Observability:** state that the `:auto`→pipe fallback logs at `Logger.debug` **by design** —
+  `:auto` is an opt-in to best-effort, so a missing length is an expected, non-alarming outcome, and
+  for some origins it would fire on every request (`info` would be noise). A caller who must
+  *guarantee* overlap should use `mode: :spool` (which errors on a missing length); a caller who
+  wants to *detect* the degraded path can check `content_length` before calling.
+- Note that, with `seekable:` removed, a stale `seekable: true` key is now an unknown option: it is
+  silently skipped by the loader and the call defaults to `mode: :pipe`. Acceptable on an unreleased
+  branch; documented so the behavior is pinned, not accidental.
 - Update the concurrency/resource-limits note to say it applies to the spool path (`:spool`, or
   `:auto` when a length is supplied).
+
+## Open question (reviewer-contested)
+
+Two of three spec reviewers flagged that `Logger.debug` for the `:auto`→pipe fallback is invisible in
+a production server (debug is off by default) — exactly the perf-sensitive proxy audience in the
+motivation. The counter-argument (held above): `:auto` is an explicit opt-in to best-effort, so the
+fallback is *expected*, and `info`-level would be per-request noise for length-less origins. Decision
+held at `debug` + prominent docs + the `mode: :spool` force-error escape hatch. Revisit if telemetry
+is ever added to Vix (no dependency today).
 
 ## Out of scope
 
