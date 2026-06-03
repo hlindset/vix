@@ -12,6 +12,8 @@
 
 **Build note:** No C is touched, so the existing `priv/vix.so` is reused — run tests with plain `mix test`. (The `VIX_COMPILATION_MODE=PRECOMPILED_LIBVIPS` env is only needed when `c_src/` changes, which this plan does not.)
 
+**Baseline:** Before Task 1, run `mix test` once and confirm a green baseline (HEIF cases skip unless `VIX_TEST_HEIF` is set) so Task 4's full-suite run isn't blocked by a pre-existing, unrelated failure.
+
 ---
 
 ## File Structure
@@ -42,7 +44,7 @@ In `test/vix/vips/image_test.exs`, rename the describe block header on line ~535
   describe "new_from_enum mode" do
 ```
 
-Then replace every `seekable: true` with `mode: :spool` inside that block. There are 8 occurrences (lines ~552, 562, 572, 577, 602, 625, 643, and the `requires content_length` call). A safe scoped replacement:
+Then replace every `seekable: true` with `mode: :spool` inside that block. There are 7 occurrences (lines ~552, 562, 572, 577, 602, 625, 643), all inside this describe block — no `seekable: true` exists elsewhere in `lib`/`test`, so the global `sed` is safe. A safe scoped replacement:
 
 ```bash
 # from repo root — only the describe block uses `seekable: true`
@@ -70,8 +72,12 @@ Add inside the describe block:
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `mix test test/vix/vips/image_test.exs:535 -v` (or the whole file)
-Expected: FAIL. The retargeted `mode: :spool` tests currently route to the pipe (the old code only checks `:seekable`), so they decode via the wrong path or mis-handle `content_length`; the unknown-mode test gets `{:ok, _}` instead of `{:error, {:invalid_mode, :bogus}}`.
+Run: `mix test test/vix/vips/image_test.exs`
+Expected: the **two driver tests** FAIL —
+  - `requires content_length for mode: :spool`: old code ignores `:mode`, routes to the pipe, decodes → `{:ok, _}` instead of `{:error, :content_length_required}`.
+  - `unknown mode returns an error tuple`: routes to the pipe, decodes → `{:ok, _}` instead of `{:error, {:invalid_mode, :bogus}}`.
+
+The retargeted **decode** tests (`decodes <fmt> identically…`) do **not** fail here: with the old code `mode: :spool` is an unknown opt that `validate_options/1` accepts and `operation_call` silently skips, so they decode green via the pipe and the dimension assertions still hold. They are regression guards (green before *and* after), not red-phase drivers — this is expected, do not try to make them fail.
 
 - [ ] **Step 4: Implement the `mode:` dispatch**
 
@@ -138,15 +144,24 @@ git commit -m "feat: mode: :pipe | :spool dispatch for new_from_enum (replaces s
 Add these inside the describe block. (`chunked/2` and `img_path/1` are already in scope.)
 
 ```elixir
-    # :auto WITH a length must use the spool — proven by the timeout watchdog, which only the spool
-    # path has. A plain decode would be indistinguishable from the pipe, so a routing regression
-    # (auto+length silently going to the pipe) would pass green without this.
+    # :auto WITH a length must use the spool — proven by the 300ms timeout watchdog, which ONLY the
+    # spool path has. Routing matters: a stalled infinite stream errors fast on the spool (watchdog),
+    # but on the pipe path it HANGS (the pipe feeder blocks on the first never-arriving chunk) until
+    # the 10s ExUnit tag. Asserting the error arrives FAST (< 2s) distinguishes them — a regression
+    # that routed :auto+length to the pipe would fail by timeout instead of passing for free.
     @tag timeout: 10_000
-    test "mode: :auto with content_length uses the spool (timeout watchdog fires)" do
+    test "mode: :auto with content_length uses the spool (fast watchdog, not a pipe hang)" do
       enum = Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
 
-      assert {:error, _} =
-               Image.new_from_enum(enum, mode: :auto, content_length: 1000, timeout: 300)
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          Image.new_from_enum(enum, mode: :auto, content_length: 1000, timeout: 300)
+        end)
+
+      assert {:error, _} = result
+
+      assert elapsed_us < 2_000_000,
+             "expected the spool watchdog (~300ms); got #{elapsed_us}µs (routed to the pipe?)"
     end
 
     # :auto WITHOUT a length falls back to the streaming pipe (decodes seek-heavy TIFF via
@@ -233,7 +248,13 @@ No test (documentation only); verify it compiles.
 
 - [ ] **Step 1: Replace the `## Seekable input` doc section**
 
-Find the existing block in the `@doc` for `new_from_enum/2` that begins "By default the enumerable is fed through a read-once OS pipe…" and ends just before `"""`. Replace from the `### Seekable input` / `## Seekable input` heading through the concurrency note with:
+In the `@doc` for `new_from_enum/2`, replace **lines 699–735** — from the heading line (exactly, including the suffix):
+
+```
+  ## Seekable input (`seekable: true`)
+```
+
+through the end of the `### Concurrency and resource limits` paragraph (the line ending `…a semaphore or worker pool gating entry into the decode.` on line 735), i.e. up to but **not** including the blank line 736 and the closing `"""` on line 737. Replace that whole span (heading + body + the `### Concurrency` subsection — leave no orphan heading or `(`seekable: true`)` suffix behind) with:
 
 ````markdown
   ## Source mode
@@ -264,6 +285,9 @@ Find the existing block in the `@doc` for `new_from_enum/2` that begins "By defa
     `:spool` (which errors on a missing length); to *detect* the fallback, check `content_length`
     before calling. Note `content_length: 0` is a valid empty-body length (routes to the spool),
     not "no length".
+
+  > The former `seekable: true` option is removed. A stray `seekable:` key is now an unknown option,
+  > silently ignored, so such a call defaults to `mode: :pipe`.
 
   Options (apply to `:spool`, and `:auto` when a length is supplied):
 
