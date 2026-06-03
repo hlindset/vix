@@ -215,14 +215,15 @@ Rewrite the `@doc` streaming section in `new_from_enum/2` (retitle the `## Seeka
 - Update the concurrency/resource-limits note to say it applies to the spool path (`:spool`, or
   `:auto` when a length is supplied).
 
-## Open question (reviewer-contested)
+## Resolved decision: fallback log level
 
 Two of three spec reviewers flagged that `Logger.debug` for the `:auto`→pipe fallback is invisible in
 a production server (debug is off by default) — exactly the perf-sensitive proxy audience in the
-motivation. The counter-argument (held above): `:auto` is an explicit opt-in to best-effort, so the
-fallback is *expected*, and `info`-level would be per-request noise for length-less origins. Decision
-held at `debug` + prominent docs + the `mode: :spool` force-error escape hatch. Revisit if telemetry
-is ever added to Vix (no dependency today).
+motivation. **Decided (project owner): hold at `Logger.debug`.** `:auto` is an explicit opt-in to
+best-effort, so the fallback is *expected*, and `info`-level would be per-request noise for
+length-less origins. A caller who must *guarantee* overlap uses `mode: :spool` (errors on a missing
+length); a caller who wants to *detect* it checks `content_length` before calling. Revisit only if
+telemetry is ever added to Vix (no dependency today).
 
 ## Out of scope
 
