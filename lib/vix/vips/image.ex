@@ -748,6 +748,24 @@ defmodule Vix.Vips.Image do
 
   defp dispatch_enum(:pipe, enum, opts), do: new_from_enum_pipe(enum, drop_spool_opts(opts))
   defp dispatch_enum(:spool, enum, opts), do: new_from_enum_spool(enum, opts)
+
+  defp dispatch_enum(:auto, enum, opts) do
+    case Keyword.get(opts, :content_length) do
+      nil ->
+        Logger.debug(fn ->
+          "Vix.Image.new_from_enum/2: mode: :auto with no content_length — " <>
+            "using streaming pipe (no seek-overlap)"
+        end)
+
+        new_from_enum_pipe(enum, drop_spool_opts(opts))
+
+      _len ->
+        # Present length (incl. negative / over-max / non-integer) goes to the spool's validation,
+        # which produces the right error. Only a nil/absent length degrades to the pipe.
+        new_from_enum_spool(enum, opts)
+    end
+  end
+
   defp dispatch_enum(other, _enum, _opts), do: {:error, {:invalid_mode, other}}
 
   # Spool-only opts must not leak to the loader on the pipe path. Hygiene, not strictly required

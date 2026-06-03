@@ -660,5 +660,64 @@ defmodule Vix.Vips.ImageTest do
                  {Image.width(ref), Image.height(ref)}
       end
     end
+
+    # :auto WITH a length must use the spool — proven by the 300ms timeout watchdog, which ONLY the
+    # spool path has. Routing matters: a stalled infinite stream errors fast on the spool (watchdog),
+    # but on the pipe path it HANGS (the pipe feeder blocks on the first never-arriving chunk) until
+    # the 10s ExUnit tag. Asserting the error arrives FAST (< 2s) distinguishes them — a regression
+    # that routed :auto+length to the pipe would fail by timeout instead of passing for free.
+    @tag timeout: 10_000
+    test "mode: :auto with content_length uses the spool (fast watchdog, not a pipe hang)" do
+      enum = Stream.resource(fn -> :s end, fn :s -> Process.sleep(:infinity) end, fn _ -> :ok end)
+
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          Image.new_from_enum(enum, mode: :auto, content_length: 1000, timeout: 300)
+        end)
+
+      assert {:error, _} = result
+
+      assert elapsed_us < 2_000_000,
+             "expected the spool watchdog (~300ms); got #{elapsed_us}µs (routed to the pipe?)"
+    end
+
+    # :auto WITHOUT a length falls back to the streaming pipe (decodes seek-heavy TIFF via
+    # read_to_memory) and logs the fallback at debug. capture_log MUST force :debug or it captures
+    # nothing and the assertion passes vacuously. test_helper.exs sets the global Logger level to
+    # :warning; we must temporarily lower it to :debug and restore on exit. Logger.configure/1 is
+    # global state, but this test is the only one in the suite that needs sub-warning capture, so
+    # the race window is negligible in practice.
+    test "mode: :auto without content_length falls back to the pipe and logs at debug" do
+      prev_level = Logger.level()
+      Logger.configure(level: :debug)
+      on_exit(fn -> Logger.configure(level: prev_level) end)
+
+      {enum, _len} = chunked(img_path("boats.tif"))
+      {:ok, ref} = Image.new_from_file(img_path("boats.tif"))
+
+      log =
+        ExUnit.CaptureLog.capture_log([level: :debug], fn ->
+          assert {:ok, img} = Image.new_from_enum(enum, mode: :auto)
+
+          assert {Image.width(img), Image.height(img)} ==
+                   {Image.width(ref), Image.height(ref)}
+        end)
+
+      assert log =~ "mode: :auto with no content_length"
+    end
+
+    # content_length: 0 is a valid empty-body length (not "no length"): it routes to the spool, which
+    # finalizes immediately, and the empty source then fails as a normal decode error.
+    test "mode: :auto with content_length: 0 routes to the spool (empty-body decode error)" do
+      assert {:error, _} = Image.new_from_enum([<<>>], mode: :auto, content_length: 0)
+    end
+
+    # :auto only softens the MISSING-length case; an over-max length still errors (cap respected).
+    test "mode: :auto with content_length over max_bytes still errors" do
+      {enum, len} = chunked(img_path("puppies.jpg"))
+
+      assert {:error, :content_length_too_large} =
+               Image.new_from_enum(enum, mode: :auto, content_length: len, max_bytes: 1)
+    end
   end
 end
