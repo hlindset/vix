@@ -1288,9 +1288,12 @@ defmodule Vix.Vips.Image do
 
   * The mutated image passed to the callback or
   * `:ok` or
-  * `{:ok, some_result}`
+  * `{:ok, some_result}` or
+  * `{:error, reason}`
 
-  Call returns updated image.
+  Call returns updated image. If the callback returns `{:error, reason}` the
+  mutations are discarded and `{:error, reason}` is returned. Any other return
+  value raises `ArgumentError`.
 
   Example
 
@@ -1301,6 +1304,16 @@ defmodule Vix.Vips.Image do
       Image.mutate(im, fn mut_image ->
         :ok = MutableImage.update(mut_image, "orientation", 0)
         :ok = MutableImage.set(mut_image, "new-field", :gint, 0)
+      end)
+  ```
+
+  Since `Vix.Vips.MutableImage` functions return `:ok | {:error, term()}`, the
+  callback can propagate a failure instead of matching on it
+
+  ```elixir
+    {:error, "No such field"} =
+      Image.mutate(im, fn mut_image ->
+        MutableImage.update(mut_image, "no-such-field", 0)
       end)
   ```
   """
@@ -1318,8 +1331,17 @@ defmodule Vix.Vips.Image do
           MutableImage.to_image(mut_image)
 
         {:ok, result} ->
-          {:ok, image} = MutableImage.to_image(mut_image)
-          {:ok, {image, result}}
+          with {:ok, image} <- MutableImage.to_image(mut_image) do
+            {:ok, {image, result}}
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+
+        other ->
+          raise ArgumentError,
+                "mutate callback must return the mutated image, `:ok`, " <>
+                  "`{:ok, result}` or `{:error, reason}`, got: #{inspect(other)}"
       end
     after
       MutableImage.stop(mut_image)

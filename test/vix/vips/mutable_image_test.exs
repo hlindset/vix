@@ -68,4 +68,29 @@ defmodule Vix.Vips.MutableImageTest do
 
     assert {:ok, _} = Vix.Vips.Image.mutate(i, & &1)
   end
+
+  test "that returning an error from the callback is an acceptable callback return" do
+    {:ok, i} = Image.new_from_file(img_path("puppies.jpg"))
+
+    assert {:error, :boom} == Image.mutate(i, fn _ -> {:error, :boom} end)
+  end
+
+  test "that a failing MutableImage call can be propagated by the callback" do
+    {:ok, i} = Image.new_from_file(img_path("puppies.jpg"))
+
+    assert {:error, "No such field"} ==
+             Image.mutate(i, fn m -> MutableImage.update(m, "no-such-field", 0) end)
+  end
+
+  test "that an unsupported callback return raises ArgumentError" do
+    {:ok, i} = Image.new_from_file(img_path("puppies.jpg"))
+
+    assert_raise ArgumentError, ~r/mutate callback must return/, fn ->
+      Image.mutate(i, fn _ -> :something_else end)
+    end
+
+    assert_raise ArgumentError, ~r/got: nil/, fn ->
+      Image.mutate(i, fn _ -> nil end)
+    end
+  end
 end
