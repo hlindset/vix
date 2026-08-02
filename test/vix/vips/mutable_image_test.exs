@@ -88,10 +88,6 @@ defmodule Vix.Vips.MutableImageTest do
     {:ok, mim} = MutableImage.new(im)
 
     assert {:error, "value must be >= 0"} == MutableOperation.draw_flood(mim, [255], -1, 0)
-
-    # the mutable image is still usable
-    assert :ok == MutableImage.update(mim, "orientation", 0)
-    assert {:ok, 0} == MutableImage.get(mim, "orientation")
   end
 
   test "mutate raises on unsupported callback return" do

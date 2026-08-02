@@ -264,7 +264,29 @@ defmodule Vix.Vips.Operation.Helper do
 
   def operation_call(name, args, opts, %{desc: _} = spec) do
     nif_args = cast_arguments_to_nif_terms(args, opts, spec.in_req_spec, spec.in_opt_spec)
+    nif_operation_call(name, nif_args, spec)
+  end
 
+  # Cast the arguments of a mutable operation, except the mutable image itself.
+  # Called before the operation is sent to the mutable image process, so that
+  # invalid arguments are reported to the caller instead of raising there.
+  def cast_mutable_args(args, opts, %{in_req_spec: [_image_spec | args_spec]} = spec) do
+    case cast_arguments_to_nif_terms(args, opts, args_spec, spec.in_opt_spec) do
+      {:error, _reason} = error -> error
+      terms -> {:ok, terms}
+    end
+  rescue
+    error in ArgumentError -> {:error, Exception.message(error)}
+  end
+
+  # Call a mutable operation with the arguments already cast by
+  # `cast_mutable_args/3`, adding the mutable image held by the process.
+  def mutable_operation_call(name, image, arg_terms, %{in_req_spec: [image_spec | _]} = spec) do
+    image_term = Type.to_nif_term(image_spec.type, image, image_spec.data)
+    nif_operation_call(name, [{image_spec.param_name, image_term} | arg_terms], spec)
+  end
+
+  defp nif_operation_call(name, nif_args, spec) do
     case Vix.Nif.nif_vips_operation_call(name, nif_args) do
       {:ok, nif_out_args} ->
         output_to_erl_terms(
