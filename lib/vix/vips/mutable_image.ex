@@ -182,7 +182,15 @@ defmodule Vix.Vips.MutableImage do
 
   @impl true
   def handle_call({:operation, callback}, _from, %{image: image} = state) do
-    {:reply, callback.(image), state}
+    # Argument casting raises on invalid input, and the caller is linked to us
+    reply =
+      try do
+        callback.(image)
+      rescue
+        error in ArgumentError -> {:error, Exception.message(error)}
+      end
+
+    {:reply, reply, state}
   end
 
   @impl true
