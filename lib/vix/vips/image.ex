@@ -1292,8 +1292,8 @@ defmodule Vix.Vips.Image do
   * `{:error, reason}`
 
   Call returns updated image. If the callback returns `{:error, reason}` the
-  mutations are discarded and `{:error, reason}` is returned. Any other return
-  value raises `ArgumentError`.
+  mutated image is discarded and `{:error, reason}` is returned. Any other
+  return value raises `ArgumentError`.
 
   Example
 
